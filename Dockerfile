@@ -25,9 +25,9 @@ COPY prisma ./prisma
 
 USER nestjs
 
-EXPOSE 3000
+EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-  CMD wget -qO- http://localhost:3000/api/v1/health || exit 1
+  CMD wget -qO- http://localhost:8080/api/v1/health || exit 1
 
 CMD ["node", "dist/main"]
