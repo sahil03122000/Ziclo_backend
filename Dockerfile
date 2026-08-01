@@ -1,3 +1,10 @@
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+ARG CACHEBUST=1
+COPY package*.json ./
+RUN npm ci
+
 # ─── Stage 1: Build ──────────────────────────────────────────────────────────
 FROM node:20-alpine AS builder
 WORKDIR /app
