@@ -1,10 +1,3 @@
-FROM node:20-alpine AS builder
-WORKDIR /app
-
-ARG CACHEBUST=1
-COPY package*.json ./
-RUN npm ci
-
 # ─── Stage 1: Build ──────────────────────────────────────────────────────────
 FROM node:20-alpine AS builder
 WORKDIR /app
@@ -15,6 +8,7 @@ RUN npm ci
 COPY . .
 RUN npx prisma generate
 RUN npm run build
+RUN find /app/dist -type f
 
 # ─── Stage 2: Production runtime ─────────────────────────────────────────────
 FROM node:20-alpine AS runtime
@@ -26,9 +20,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=builder /app/dist ./dist
-# Generated Prisma query-engine binaries
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
-# Schema needed by prisma migrate deploy
 COPY prisma ./prisma
 
 USER nestjs
