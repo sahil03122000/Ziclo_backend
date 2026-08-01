@@ -1,0 +1,13 @@
+node_modules
+dist
+.env
+.env.*
+!.env.example
+firebase/service-account.json
+.git
+.gitignore
+coverage
+test
+*.md
+.eslintrc*
+.prettierrc

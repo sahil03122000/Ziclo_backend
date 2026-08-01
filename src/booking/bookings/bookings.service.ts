@@ -1,0 +1,1147 @@
+import {
+  BadRequestException,
+  ForbiddenException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import { ActivityAction, ActivityModule, AuditAction, Booking, BookingStatus, NotificationType, PaymentMethod, PaymentStatus, PaymentType, Prisma, Role, TaskPhotoType } from '@prisma/client';
+import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
+
+import { ActivityLogService } from '../../activity-log/activity-log.service';
+import { DEFAULTS, SETTING_KEYS } from '../../admin/admin.service';
+import { AuditLogsService } from '../../audit-logs/audit-logs.service';
+import type { AuthUser } from '../../common/types/auth-user.type';
+import { InvoicesService } from '../../invoicing/invoices/invoices.service';
+import { PaymentsService } from '../../invoicing/payments/payments.service';
+import { VerifyRazorpayDto } from '../../invoicing/payments/dto/verify-razorpay.dto';
+import { NotificationsService } from '../../notifications/notifications.service';
+import { PrismaService } from '../../prisma/prisma.service';
+import { AddBookingPhotoDto } from './dto/add-booking-photo.dto';
+import { AssignManagerDto } from './dto/assign-manager.dto';
+import { AssignWorkerDto } from './dto/assign-worker.dto';
+import { BookingQueryDto } from './dto/booking-query.dto';
+import { CancelBookingDto } from './dto/cancel-booking.dto';
+import { CollectPaymentDto } from './dto/collect-payment.dto';
+import { CreateBookingDto } from './dto/create-booking.dto';
+import { PreviewBookingPriceDto } from './dto/preview-booking-price.dto';
+import { RescheduleBookingDto } from './dto/reschedule-booking.dto';
+import { StartBookingDto } from './dto/start-booking.dto';
+import { VerifyBookingPaymentDto } from './dto/verify-booking-payment.dto';
+import { UpdateBookingDto } from './dto/update-booking.dto';
+
+// ─── Select shapes ─────────────────────────────────────────────────────────────
+
+const BOOKING_USER_SELECT = {
+  id: true, name: true, email: true, phone: true, role: true, profileImage: true,
+} satisfies Prisma.UserSelect;
+
+const BOOKING_INCLUDE = {
+  service:                  { select: { id: true, name: true, thumbnail: true } },
+  propertyType:             { select: { id: true, name: true } },
+  package:      { select: { id: true, name: true, price: true, durationMinutes: true } },
+  pricingOption: { select: { id: true, label: true, price: true } },
+  timeSlot:     { select: { id: true, date: true, startTime: true, endTime: true } },
+  address:      true,
+  customer:     { select: BOOKING_USER_SELECT },
+  worker:       { select: BOOKING_USER_SELECT },
+  manager:      { select: BOOKING_USER_SELECT },
+  createdBy:    { select: BOOKING_USER_SELECT },
+  photos:       { orderBy: { createdAt: 'asc' as const } },
+} satisfies Prisma.BookingInclude;
+
+// Payment method as the Worker Panel UI knows it ('qr' | 'cash') — the app only ever
+// collects one of these two in person, mapped onto the broader PaymentMethod enum used
+// everywhere else (UPI / CASH respectively) so no new enum is introduced.
+const PAYMENT_METHOD_TO_UI: Partial<Record<PaymentMethod, 'qr' | 'cash'>> = {
+  [PaymentMethod.UPI]: 'qr',
+  [PaymentMethod.CASH]: 'cash',
+};
+const PAYMENT_METHOD_FROM_UI: Record<'qr' | 'cash', PaymentMethod> = {
+  qr: PaymentMethod.UPI,
+  cash: PaymentMethod.CASH,
+};
+
+// Worker-facing booking status ('assigned' → 'accepted' once workerAcceptedAt is set) —
+// distinct from the admin/manager-facing BookingStatus enum above, which is unchanged.
+type WorkerJobStatus = 'assigned' | 'accepted' | 'in-progress' | 'completed' | 'cancelled';
+
+function toWorkerJobStatus(booking: { status: BookingStatus; workerAcceptedAt: Date | null }): WorkerJobStatus {
+  switch (booking.status) {
+    case BookingStatus.ASSIGNED:
+      return booking.workerAcceptedAt ? 'accepted' : 'assigned';
+    case BookingStatus.IN_PROGRESS:
+      return 'in-progress';
+    case BookingStatus.COMPLETED:
+      return 'completed';
+    default:
+      return 'cancelled';
+  }
+}
+
+const BOOKING_DETAIL_INCLUDE = {
+  ...BOOKING_INCLUDE,
+  statusHistory: {
+    select: {
+      id: true, status: true, note: true, createdAt: true,
+      actor: { select: { id: true, name: true, role: true } },
+    },
+    orderBy: { createdAt: 'asc' as const },
+  },
+} satisfies Prisma.BookingInclude;
+
+// ─── Status machine ────────────────────────────────────────────────────────────
+
+const ALLOWED_TRANSITIONS: Partial<Record<BookingStatus, BookingStatus[]>> = {
+  [BookingStatus.PENDING_PAYMENT]: [BookingStatus.PENDING, BookingStatus.CANCELLED],
+  [BookingStatus.PENDING]:     [BookingStatus.CONFIRMED, BookingStatus.CANCELLED],
+  [BookingStatus.CONFIRMED]:   [BookingStatus.ASSIGNED, BookingStatus.IN_PROGRESS, BookingStatus.CANCELLED, BookingStatus.RESCHEDULED, BookingStatus.NO_SHOW],
+  [BookingStatus.ASSIGNED]:    [BookingStatus.IN_PROGRESS, BookingStatus.COMPLETED, BookingStatus.CANCELLED],
+  [BookingStatus.IN_PROGRESS]: [BookingStatus.COMPLETED, BookingStatus.CANCELLED],
+  [BookingStatus.RESCHEDULED]: [BookingStatus.CONFIRMED, BookingStatus.CANCELLED],
+};
+
+const TERMINAL_STATUSES: BookingStatus[] = [
+  BookingStatus.COMPLETED, BookingStatus.CANCELLED, BookingStatus.NO_SHOW,
+];
+
+const r2 = (n: number) => parseFloat(n.toFixed(2));
+
+// ─── Worker job response shaping ───────────────────────────────────────────────
+// Maps a Booking (BOOKING_INCLUDE shape) onto the flat "job" contract the Worker Panel
+// screens (Jobs / Job Details / Start Work / Before-After Image / Payment / Complete Task)
+// bind to — a single source of truth reused by every worker-facing booking read below.
+
+type WorkerJobBooking = Prisma.BookingGetPayload<{ include: typeof BOOKING_INCLUDE }>;
+
+function formatSlotTime(timeSlot: WorkerJobBooking['timeSlot']): string {
+  if (!timeSlot) return '';
+  const fmt = (t: string) => {
+    const [hStr, m] = t.split(':');
+    const h = parseInt(hStr, 10);
+    const period = h >= 12 ? 'PM' : 'AM';
+    const h12 = h % 12 === 0 ? 12 : h % 12;
+    return m === '00' ? `${h12} ${period}` : `${h12}:${m} ${period}`;
+  };
+  return `${fmt(timeSlot.startTime)} - ${fmt(timeSlot.endTime)}`;
+}
+
+function toWorkerJobDto(booking: WorkerJobBooking) {
+  const beforePhoto = booking.photos.find((p) => p.type === TaskPhotoType.BEFORE) ?? null;
+  const afterPhoto = booking.photos.find((p) => p.type === TaskPhotoType.AFTER) ?? null;
+
+  return {
+    id: booking.id,
+    status: toWorkerJobStatus(booking),
+    serviceType: booking.service.name,
+    customerName: booking.customer.name,
+    customerPhone: booking.customer.phone,
+    address: booking.address?.street ?? '',
+    city: booking.address?.city ?? '',
+    pincode: booking.address?.pincode ?? '',
+    lat: booking.address?.latitude ?? null,
+    lng: booking.address?.longitude ?? null,
+    scheduledDate: booking.scheduledAt.toISOString().split('T')[0],
+    scheduledTime: formatSlotTime(booking.timeSlot),
+    amount: booking.totalAmount ?? 0,
+    advancePaid: booking.advanceAmount ?? 0,
+    description: `${booking.package.name} — ${booking.propertyType.name}`,
+    notes: booking.notes ?? '',
+    startLocation:
+      booking.workerStartLatitude != null && booking.workerStartLongitude != null
+        ? { lat: booking.workerStartLatitude, lng: booking.workerStartLongitude }
+        : null,
+    startTimestamp: booking.workerStartAt?.toISOString() ?? null,
+    beforeImage: beforePhoto
+      ? {
+          uri: beforePhoto.imageUrl,
+          timestamp: beforePhoto.createdAt.toISOString(),
+          coords: beforePhoto.latitude != null && beforePhoto.longitude != null
+            ? { lat: beforePhoto.latitude, lng: beforePhoto.longitude }
+            : null,
+        }
+      : null,
+    afterImage: afterPhoto
+      ? {
+          uri: afterPhoto.imageUrl,
+          timestamp: afterPhoto.createdAt.toISOString(),
+          coords: afterPhoto.latitude != null && afterPhoto.longitude != null
+            ? { lat: afterPhoto.latitude, lng: afterPhoto.longitude }
+            : null,
+        }
+      : null,
+    paymentMethod: booking.paymentCollectionMethod
+      ? (PAYMENT_METHOD_TO_UI[booking.paymentCollectionMethod] ?? 'cash')
+      : null,
+  };
+}
+
+// ─── Service ──────────────────────────────────────────────────────────────────
+
+@Injectable()
+export class BookingsService {
+  private readonly logger = new Logger(BookingsService.name);
+
+  // TEMPORARY diagnostic wrapper for createBooking() — logs the query label before running
+  // it and the Prisma error code/meta/message if it throws. Remove once the 500 investigation
+  // on POST /bookings is closed out.
+  private async runQuery<T>(label: string, fn: () => Promise<T>): Promise<T> {
+    this.logger.log(`[createBooking] running query: ${label}`);
+    try {
+      return await fn();
+    } catch (error) {
+      if (error instanceof PrismaClientKnownRequestError) {
+        this.logger.error(
+          `[createBooking] FAILED query: ${label} | prismaCode=${error.code} | meta=${JSON.stringify(error.meta)} | message=${error.message}`,
+        );
+      } else {
+        this.logger.error(`[createBooking] FAILED query: ${label} | ${(error as Error).message}`, (error as Error).stack);
+      }
+      throw error;
+    }
+  }
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly notifications: NotificationsService,
+    private readonly auditLogs: AuditLogsService,
+    private readonly activityLog: ActivityLogService,
+    private readonly invoicesService: InvoicesService,
+    private readonly paymentsService: PaymentsService,
+  ) {}
+
+  // ─── Create ───────────────────────────────────────────────────────────────────
+
+  async create(dto: CreateBookingDto, customerId: string, orgId?: string) {
+    const service = await this.runQuery('service lookup (service.findUnique)', () =>
+      this.prisma.service.findUnique({
+        where: { id: dto.serviceId },
+        select: { id: true, name: true, isActive: true },
+      }),
+    );
+    if (!service) throw new NotFoundException('Service not found');
+    if (!service.isActive) throw new BadRequestException('Service is not available for booking');
+
+    const propertyType = await this.runQuery('property type lookup (propertyType.findUnique)', () =>
+      this.prisma.propertyType.findUnique({
+        where: { id: dto.propertyTypeId },
+        select: { id: true, serviceId: true, isActive: true },
+      }),
+    );
+    if (!propertyType || propertyType.serviceId !== dto.serviceId) {
+      throw new BadRequestException('Property type does not belong to the selected service');
+    }
+    if (!propertyType.isActive) throw new BadRequestException('Property type is not available for booking');
+
+    const pkg = await this.runQuery('package lookup (package.findUnique)', () =>
+      this.prisma.package.findUnique({
+        where: { id: dto.packageId },
+        select: { id: true, propertyTypeId: true, price: true, isActive: true },
+      }),
+    );
+    if (!pkg || pkg.propertyTypeId !== dto.propertyTypeId) {
+      throw new BadRequestException('Package does not belong to the selected property type');
+    }
+    if (!pkg.isActive) throw new BadRequestException('Package is not available for booking');
+
+    const pricingOption = await this.runQuery('pricing option lookup (pricingOption.findUnique)', () =>
+      this.prisma.pricingOption.findUnique({
+        where: { id: dto.pricingOptionId },
+        select: { id: true, packageId: true, isActive: true, price: true },
+      }),
+    );
+    if (!pricingOption || pricingOption.packageId !== dto.packageId) {
+      throw new BadRequestException('Pricing option does not belong to the selected package');
+    }
+    if (!pricingOption.isActive) {
+      throw new BadRequestException('Pricing option is not available for booking');
+    }
+
+    const scheduledAt = new Date(dto.bookingDate);
+    if (scheduledAt < new Date()) throw new BadRequestException('Booking date must be in the future');
+
+    await this.runQuery('time slot lookup + capacity check (validateAndClaimSlot)', () =>
+      this.validateAndClaimSlot(dto.timeSlotId, dto.serviceId),
+    );
+
+    const address = await this.runQuery('address lookup (address.findUnique)', () =>
+      this.prisma.address.findUnique({ where: { id: dto.addressId } }),
+    );
+    if (!address || address.userId !== customerId) {
+      throw new BadRequestException('Invalid address');
+    }
+
+    const bookingRef = await this.runQuery('booking ref generation (booking.count)', () => this.generateRef());
+    const totalAmount = pricingOption.price;
+
+    const booking = await this.runQuery('create booking (booking.create)', () =>
+      this.prisma.booking.create({
+        data: {
+          serviceId:      dto.serviceId,
+          propertyTypeId: dto.propertyTypeId,
+          packageId:      dto.packageId,
+          pricingOptionId: dto.pricingOptionId,
+          timeSlotId:     dto.timeSlotId,
+          customerId,
+          scheduledAt,
+          notes:          dto.notes,
+          createdById:    customerId,
+          organizationId: orgId ?? null,
+          addressId:      dto.addressId,
+          totalAmount,
+          advanceAmount:  totalAmount,
+          packagePrice:   pkg.price,
+          bookingRef,
+          status:         BookingStatus.PENDING_PAYMENT,
+          paymentStatus:  PaymentStatus.CREATED,
+        },
+        include: BOOKING_INCLUDE,
+      }),
+    );
+
+    await this.runQuery('booking status history insert (bookingStatusHistory.create)', () =>
+      this.recordStatusHistory(booking.id, BookingStatus.PENDING_PAYMENT, customerId, 'Booking created — awaiting payment'),
+    );
+
+    this.auditLogs
+      .log({ actorId: customerId, entityType: 'Booking', entityId: booking.id, action: AuditAction.CREATE, newValue: { serviceId: dto.serviceId, scheduledAt } })
+      .catch(() => {});
+    this.activityLog.log({
+      action: ActivityAction.BOOKING_CREATED,
+      module: ActivityModule.BOOKING,
+      description: `${booking.customer.name} booked ${booking.service.name}`,
+      actor: { id: customerId, name: booking.customer.name, role: booking.customer.role },
+      target: { id: booking.id, type: 'Booking' },
+      organizationId: orgId,
+      metadata: { bookingRef: booking.bookingRef, amount: booking.totalAmount, scheduledAt: booking.scheduledAt },
+    });
+
+    // Fire-and-forget — never block booking creation on notification delivery.
+    this.notifyAreaManagers(booking, address.pincode).catch(() => {});
+
+    return { success: true, message: 'Booking created successfully', data: booking };
+  }
+
+  // Finds managers whose assigned Area covers the customer's address pincode and notifies
+  // each of them that a new booking landed in their area. Reuses NotificationsService.notify
+  // (persists an unread Notification row + dispatches an FCM push when configured) — no new
+  // notification delivery mechanism is introduced.
+  private async notifyAreaManagers(
+    booking: { id: string; bookingRef: string | null; service: { name: string } },
+    pincode: string,
+  ): Promise<void> {
+    const area = await this.prisma.area.findFirst({ where: { pincode, isActive: true }, select: { id: true } });
+    if (!area) return;
+
+    const managerAreas = await this.prisma.managerArea.findMany({
+      where: { areaId: area.id },
+      select: { manager: { select: { userId: true } } },
+    });
+
+    await Promise.all(
+      managerAreas.map((ma) =>
+        this.notifications
+          .notify(
+            ma.manager.userId,
+            'New Booking in Your Area',
+            `A new booking (${booking.bookingRef ?? booking.id}) for ${booking.service.name} was created in your assigned area.`,
+            { bookingId: booking.id },
+            NotificationType.BOOKING_CREATED,
+          )
+          .catch(() => {}),
+      ),
+    );
+  }
+
+  // ─── Read ─────────────────────────────────────────────────────────────────────
+
+  async findAll(query: BookingQueryDto, orgId?: string) {
+    const { page = 1, limit = 20, status, customerId, workerId, managerId, serviceId, scheduledFrom, scheduledTo } = query;
+    const skip = (page - 1) * limit;
+    const where = this.buildWhere({ status, customerId, workerId, managerId, serviceId, scheduledFrom, scheduledTo });
+
+    if (orgId) where.organizationId = orgId;
+
+    const [bookings, total] = await this.prisma.$transaction([
+      this.prisma.booking.findMany({ where, include: BOOKING_INCLUDE, skip, take: limit, orderBy: { scheduledAt: 'asc' } }),
+      this.prisma.booking.count({ where }),
+    ]);
+
+    return {
+      success: true,
+      data: { bookings, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } },
+    };
+  }
+
+  async findOne(id: string) {
+    const booking = await this.prisma.booking.findUnique({ where: { id }, include: BOOKING_DETAIL_INCLUDE });
+    if (!booking) throw new NotFoundException('Booking not found');
+    return { success: true, data: booking };
+  }
+
+  async getSummary(id: string) {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id },
+      include: {
+        service:      { select: { id: true, name: true, thumbnail: true } },
+        propertyType: { select: { id: true, name: true } },
+        package:      { select: { id: true, name: true, description: true, price: true, durationMinutes: true } },
+        address:      true,
+        customer:     { select: { id: true, name: true, email: true, phone: true } },
+      },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+
+    return {
+      success: true,
+      data: {
+        bookingRef: booking.bookingRef,
+        status: booking.status,
+        service: booking.service,
+        scheduledAt: booking.scheduledAt,
+        customer: booking.customer,
+        address: booking.address,
+        propertyType: booking.propertyType,
+        package: booking.package
+          ? { ...booking.package, price: booking.packagePrice ?? booking.package.price }
+          : null,
+        pricing: {
+          totalAmount: booking.totalAmount,
+          advanceAmount: booking.advanceAmount,
+        },
+        notes: booking.notes,
+      },
+    };
+  }
+
+  // Customer-facing: home "Recent Activity", "Booking History", and "Upcoming Bookings" all
+  // read from this one method. A booking sits in PENDING_PAYMENT (awaiting Razorpay
+  // verification) from the moment it's created — until verifyBookingPayment confirms it, it
+  // must stay invisible here so a failed/abandoned payment never shows the customer a
+  // "booking" that isn't real. Callers can still explicitly filter `status: PENDING_PAYMENT`
+  // (e.g. a future "payment pending" tab).
+  async getMyBookings(customerId: string, query: BookingQueryDto) {
+    const { page = 1, limit = 20, status, serviceId, scheduledFrom, scheduledTo } = query;
+    const skip = (page - 1) * limit;
+    const where = this.buildWhere({ customerId, status, serviceId, scheduledFrom, scheduledTo });
+    if (!status) where.status = { not: BookingStatus.PENDING_PAYMENT };
+
+    const [bookings, total] = await this.prisma.$transaction([
+      this.prisma.booking.findMany({ where, include: BOOKING_INCLUDE, skip, take: limit, orderBy: { scheduledAt: 'desc' } }),
+      this.prisma.booking.count({ where }),
+    ]);
+
+    return {
+      success: true,
+      data: { bookings, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } },
+    };
+  }
+
+  async getManagerBookings(managerId: string, query: BookingQueryDto) {
+    const { page = 1, limit = 20, status, serviceId, scheduledFrom, scheduledTo } = query;
+    const skip = (page - 1) * limit;
+    const where = this.buildWhere({ managerId, status, serviceId, scheduledFrom, scheduledTo });
+
+    const [bookings, total] = await this.prisma.$transaction([
+      this.prisma.booking.findMany({ where, include: BOOKING_INCLUDE, skip, take: limit, orderBy: { scheduledAt: 'asc' } }),
+      this.prisma.booking.count({ where }),
+    ]);
+
+    return {
+      success: true,
+      data: { bookings, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } },
+    };
+  }
+
+  // Worker Panel "Jobs" screen — response shaped via toWorkerJobDto (see above) to match
+  // the UI's flat job contract directly, rather than the nested admin/manager booking shape.
+  async getWorkerBookings(workerId: string, query: BookingQueryDto) {
+    const { page = 1, limit = 20, status, serviceId, scheduledFrom, scheduledTo } = query;
+    const skip = (page - 1) * limit;
+    const where = this.buildWhere({ workerId, status, serviceId, scheduledFrom, scheduledTo });
+
+    const [bookings, total] = await this.prisma.$transaction([
+      this.prisma.booking.findMany({ where, include: BOOKING_INCLUDE, skip, take: limit, orderBy: { scheduledAt: 'asc' } }),
+      this.prisma.booking.count({ where }),
+    ]);
+
+    return {
+      success: true,
+      data: {
+        jobs: bookings.map(toWorkerJobDto),
+        meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
+      },
+    };
+  }
+
+  // Worker Panel "Job Details" screen — single job, ownership-checked.
+  async getWorkerJobById(id: string, workerId: string) {
+    const booking = await this.prisma.booking.findUnique({ where: { id }, include: BOOKING_INCLUDE });
+    if (!booking) throw new NotFoundException('Job not found');
+    if (booking.workerId !== workerId) throw new ForbiddenException('This job is not assigned to you');
+    return { success: true, data: toWorkerJobDto(booking) };
+  }
+
+  // Worker Panel "Start Work" (accept step) — ASSIGNED, not yet accepted → accepted.
+  async acceptByWorker(id: string, workerId: string) {
+    const booking = await this.requireBookingWithService(id);
+    if (booking.workerId !== workerId) throw new ForbiddenException('This job is not assigned to you');
+    if (booking.status !== BookingStatus.ASSIGNED) {
+      throw new BadRequestException('Only an assigned job can be accepted');
+    }
+
+    const updated = await this.prisma.booking.update({
+      where: { id },
+      data: { workerAcceptedAt: new Date() },
+      include: BOOKING_INCLUDE,
+    });
+
+    this.audit(workerId, id, AuditAction.UPDATE, { workerAcceptedAt: updated.workerAcceptedAt });
+
+    this.notifications.notify(booking.customerId, 'Worker Accepted Your Booking', `Your worker for ${booking.service.name} has accepted the job.`, { bookingId: id }, NotificationType.WORKER_ACCEPTED).catch(() => {});
+    if (booking.managerId) {
+      this.notifications.notify(booking.managerId, 'Worker Accepted Job', `The worker assigned to booking ${booking.bookingRef ?? id} has accepted it.`, { bookingId: id }, NotificationType.WORKER_ACCEPTED).catch(() => {});
+    }
+
+    return { success: true, message: 'Job accepted', data: toWorkerJobDto(updated) };
+  }
+
+  // Worker Panel "Before Photo" / "After Photo" steps.
+  async addPhoto(id: string, workerId: string, dto: AddBookingPhotoDto) {
+    const booking = await this.requireBooking(id);
+    if (booking.workerId !== workerId) throw new ForbiddenException('This job is not assigned to you');
+
+    await this.prisma.bookingPhoto.create({
+      data: {
+        bookingId: id,
+        imageUrl: dto.imageUrl,
+        type: dto.type,
+        latitude: dto.latitude,
+        longitude: dto.longitude,
+      },
+    });
+
+    const updated = await this.prisma.booking.findUniqueOrThrow({ where: { id }, include: BOOKING_INCLUDE });
+    return { success: true, message: 'Photo saved', data: toWorkerJobDto(updated) };
+  }
+
+  // Worker Panel "Payment" step.
+  async collectPayment(id: string, workerId: string, dto: CollectPaymentDto) {
+    const booking = await this.requireBooking(id);
+    if (booking.workerId !== workerId) throw new ForbiddenException('This job is not assigned to you');
+
+    const updated = await this.prisma.booking.update({
+      where: { id },
+      data: {
+        paymentCollectionMethod: PAYMENT_METHOD_FROM_UI[dto.method],
+        paymentCollectedAt: new Date(),
+      },
+      include: BOOKING_INCLUDE,
+    });
+
+    this.audit(workerId, id, AuditAction.UPDATE, { paymentCollectionMethod: updated.paymentCollectionMethod });
+
+    return { success: true, message: 'Payment recorded', data: toWorkerJobDto(updated) };
+  }
+
+  async getCustomerHistory(customerId: string, query: BookingQueryDto) {
+    const { page = 1, limit = 20, status, serviceId, scheduledFrom, scheduledTo } = query;
+    const skip = (page - 1) * limit;
+    const where = this.buildWhere({ customerId, status, serviceId, scheduledFrom, scheduledTo });
+
+    const [bookings, total] = await this.prisma.$transaction([
+      this.prisma.booking.findMany({ where, include: BOOKING_INCLUDE, skip, take: limit, orderBy: { scheduledAt: 'desc' } }),
+      this.prisma.booking.count({ where }),
+    ]);
+
+    return {
+      success: true,
+      data: { bookings, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } },
+    };
+  }
+
+  // ─── Update ───────────────────────────────────────────────────────────────────
+
+  async update(id: string, dto: UpdateBookingDto, actorId: string) {
+    const booking = await this.requireBooking(id);
+    this.assertNotTerminal(booking.status);
+
+    if (dto.scheduledAt && booking.status !== BookingStatus.PENDING) {
+      throw new BadRequestException('scheduledAt can only be changed while booking is PENDING');
+    }
+    if (dto.scheduledAt && dto.scheduledAt < new Date()) {
+      throw new BadRequestException('Scheduled date must be in the future');
+    }
+
+    const updated = await this.prisma.booking.update({
+      where: { id },
+      data: {
+        ...(dto.notes       !== undefined && { notes:       dto.notes }),
+        ...(dto.scheduledAt !== undefined && { scheduledAt: dto.scheduledAt }),
+      },
+      include: BOOKING_INCLUDE,
+    });
+
+    this.auditLogs
+      .log({ actorId, entityType: 'Booking', entityId: id, action: AuditAction.UPDATE, newValue: { ...dto } })
+      .catch(() => {});
+
+    return { success: true, message: 'Booking updated', data: updated };
+  }
+
+  // ─── Delete ───────────────────────────────────────────────────────────────────
+
+  async remove(id: string, actorId: string) {
+    const booking = await this.requireBooking(id);
+    if (!TERMINAL_STATUSES.includes(booking.status)) {
+      throw new BadRequestException('Only completed, cancelled, or no-show bookings can be deleted');
+    }
+    await this.prisma.booking.delete({ where: { id } });
+
+    this.auditLogs
+      .log({ actorId, entityType: 'Booking', entityId: id, action: AuditAction.DELETE, oldValue: { status: booking.status } })
+      .catch(() => {});
+
+    return { success: true, message: 'Booking deleted successfully' };
+  }
+
+  // ─── Assign Manager → CONFIRMED ───────────────────────────────────────────────
+
+  async assignManager(id: string, actorId: string, dto: AssignManagerDto) {
+    const booking = await this.requireBookingWithService(id);
+    this.assertNotTerminal(booking.status);
+
+    const manager = await this.prisma.user.findUnique({
+      where: { id: dto.managerId },
+      select: { id: true, name: true, role: true, isActive: true },
+    });
+    if (!manager || (manager.role !== Role.MANAGER && manager.role !== Role.ADMIN)) {
+      throw new BadRequestException('Assigned user is not a valid manager');
+    }
+    if (!manager.isActive) throw new BadRequestException('Manager account is inactive');
+
+    const updated = await this.prisma.booking.update({
+      where: { id },
+      data: { managerId: dto.managerId, status: BookingStatus.CONFIRMED },
+      include: BOOKING_INCLUDE,
+    });
+
+    await this.recordStatusHistory(id, BookingStatus.CONFIRMED, actorId, `Assigned to manager: ${manager.name}`);
+    this.audit(actorId, id, AuditAction.ASSIGN, { managerId: dto.managerId, status: BookingStatus.CONFIRMED });
+
+    this.notifications.notify(dto.managerId, 'Booking Assigned to You', `Booking for ${booking.service.name} on ${booking.scheduledAt.toISOString().slice(0, 10)} has been assigned to you.`, { bookingId: id }, NotificationType.MANAGER_ASSIGNED).catch(() => {});
+    this.notifications.notify(booking.customerId, 'Booking Confirmed', `Your booking for ${booking.service.name} has been confirmed.`, { bookingId: id }, NotificationType.MANAGER_ASSIGNED).catch(() => {});
+
+    return { success: true, message: 'Manager assigned and booking confirmed', data: updated };
+  }
+
+  // ─── Assign Worker → ASSIGNED ─────────────────────────────────────────────────
+
+  async assignWorker(id: string, actorId: string, dto: AssignWorkerDto) {
+    const booking = await this.requireBookingWithService(id);
+    this.assertNotTerminal(booking.status);
+
+    const worker = await this.prisma.user.findUnique({
+      where: { id: dto.workerId },
+      select: { id: true, name: true, role: true, isActive: true },
+    });
+    if (!worker || worker.role !== Role.WORKER) throw new BadRequestException('Assigned user is not a valid worker');
+    if (!worker.isActive) throw new BadRequestException('Worker account is inactive');
+
+    const updated = await this.prisma.booking.update({
+      where: { id },
+      data: { workerId: dto.workerId, status: BookingStatus.ASSIGNED },
+      include: BOOKING_INCLUDE,
+    });
+
+    await this.recordStatusHistory(id, BookingStatus.ASSIGNED, actorId, `Assigned to worker: ${worker.name}`);
+    this.audit(actorId, id, AuditAction.ASSIGN, { workerId: dto.workerId, status: BookingStatus.ASSIGNED });
+    this.activityLog.log({
+      action: ActivityAction.WORKER_ASSIGNED,
+      module: ActivityModule.BOOKING,
+      description: `${worker.name} assigned to booking ${booking.bookingRef ?? id}`,
+      actor: { id: actorId, name: 'Manager', role: Role.MANAGER },
+      target: { id: booking.id, type: 'Booking' },
+      metadata: { bookingRef: booking.bookingRef, workerName: worker.name, workerId: dto.workerId },
+    });
+
+    this.notifications.notify(dto.workerId, 'Booking Assigned to You', `You have been assigned to ${booking.service.name} on ${booking.scheduledAt.toISOString().slice(0, 10)}.`, { bookingId: id }, NotificationType.WORKER_ASSIGNED).catch(() => {});
+    this.notifications.notify(booking.customerId, 'Worker Assigned', `A worker has been assigned to your booking for ${booking.service.name}.`, { bookingId: id }, NotificationType.WORKER_ASSIGNED).catch(() => {});
+
+    return { success: true, message: 'Worker assigned and booking set to ASSIGNED', data: updated };
+  }
+
+  // ─── Confirm ──────────────────────────────────────────────────────────────────
+
+  async confirm(id: string, managerId: string) {
+    const booking = await this.requireBookingWithService(id);
+    this.assertNotTerminal(booking.status);
+    this.assertTransition(booking.status, BookingStatus.CONFIRMED);
+
+    const updated = await this.prisma.booking.update({
+      where: { id },
+      data: { status: BookingStatus.CONFIRMED, managerId },
+      include: BOOKING_INCLUDE,
+    });
+
+    await this.recordStatusHistory(id, BookingStatus.CONFIRMED, managerId);
+    this.audit(managerId, id, AuditAction.STATUS_CHANGE, { status: BookingStatus.CONFIRMED });
+
+    this.notifications.notify(booking.customerId, 'Booking Confirmed', `Your booking for ${booking.service.name} has been confirmed.`, { bookingId: id }).catch(() => {});
+
+    return { success: true, message: 'Booking confirmed', data: updated };
+  }
+
+  // ─── Start ────────────────────────────────────────────────────────────────────
+
+  async start(id: string, workerId: string, dto?: StartBookingDto) {
+    const booking = await this.requireBookingWithService(id);
+    if (booking.workerId !== workerId) throw new ForbiddenException('This booking is not assigned to you');
+    this.assertTransition(booking.status, BookingStatus.IN_PROGRESS);
+
+    const updated = await this.prisma.booking.update({
+      where: { id },
+      data: {
+        status: BookingStatus.IN_PROGRESS,
+        workerStartAt: new Date(),
+        workerStartLatitude: dto?.latitude,
+        workerStartLongitude: dto?.longitude,
+      },
+      include: BOOKING_INCLUDE,
+    });
+
+    await this.recordStatusHistory(id, BookingStatus.IN_PROGRESS, workerId);
+    this.audit(workerId, id, AuditAction.STATUS_CHANGE, { status: BookingStatus.IN_PROGRESS });
+
+    this.notifications.notify(booking.customerId, 'Service Started', `Your booking for ${booking.service.name} is now in progress.`, { bookingId: id }, NotificationType.WORK_STARTED).catch(() => {});
+
+    return { success: true, message: 'Booking started', data: toWorkerJobDto(updated) };
+  }
+
+  // ─── Complete ─────────────────────────────────────────────────────────────────
+
+  async complete(id: string, actorId: string) {
+    const booking = await this.requireBookingWithService(id);
+
+    const actor = await this.prisma.user.findUnique({ where: { id: actorId }, select: { role: true } });
+    if (actor?.role === Role.WORKER && booking.workerId !== actorId) {
+      throw new ForbiddenException('This booking is not assigned to you');
+    }
+
+    const completableStatuses: BookingStatus[] = [BookingStatus.ASSIGNED, BookingStatus.IN_PROGRESS];
+    if (!completableStatuses.includes(booking.status)) {
+      throw new BadRequestException(`Cannot complete a booking in ${booking.status} state`);
+    }
+
+    const updated = await this.prisma.booking.update({
+      where: { id },
+      data: { status: BookingStatus.COMPLETED, completedAt: new Date() },
+      include: BOOKING_INCLUDE,
+    });
+
+    await this.recordStatusHistory(id, BookingStatus.COMPLETED, actorId);
+    this.audit(actorId, id, AuditAction.STATUS_CHANGE, { status: BookingStatus.COMPLETED });
+    this.activityLog.log({
+      action: ActivityAction.BOOKING_COMPLETED,
+      module: ActivityModule.BOOKING,
+      description: `Booking ${booking.bookingRef ?? id} completed — ${booking.service.name}`,
+      actor: { id: actorId, name: 'Staff', role: actor?.role ?? Role.WORKER },
+      target: { id: booking.id, type: 'Booking' },
+      metadata: { bookingRef: booking.bookingRef, serviceName: booking.service.name },
+    });
+
+    this.notifications.notify(booking.customerId, 'Booking Completed', `Your booking for ${booking.service.name} has been completed. Thank you!`, { bookingId: id }, NotificationType.WORK_COMPLETED).catch(() => {});
+
+    return { success: true, message: 'Booking completed', data: updated };
+  }
+
+  // ─── Cancel ───────────────────────────────────────────────────────────────────
+
+  async cancel(id: string, actorId: string, dto: CancelBookingDto) {
+    const booking = await this.requireBookingWithService(id);
+
+    const actor = await this.prisma.user.findUnique({ where: { id: actorId }, select: { role: true } });
+    const isOwner = booking.customerId === actorId;
+    const isPrivileged = actor?.role === Role.ADMIN || actor?.role === Role.MANAGER || actor?.role === Role.SUPER_ADMIN;
+    // Worker Panel "Cancel" — only before they've accepted the job (mock UI only offers
+    // Cancel while the job is still in its initial 'assigned' state).
+    const isAssignedWorker =
+      actor?.role === Role.WORKER &&
+      booking.workerId === actorId &&
+      booking.status === BookingStatus.ASSIGNED &&
+      !booking.workerAcceptedAt;
+
+    if (!isOwner && !isPrivileged && !isAssignedWorker) {
+      throw new ForbiddenException('You do not have permission to cancel this booking');
+    }
+    this.assertNotTerminal(booking.status);
+    this.assertTransition(booking.status, BookingStatus.CANCELLED);
+
+    if (booking.timeSlotId) await this.releaseSlot(booking.timeSlotId);
+
+    const updated = await this.prisma.booking.update({
+      where: { id },
+      data: { status: BookingStatus.CANCELLED, cancelledAt: new Date(), cancelReason: dto.reason },
+      include: BOOKING_INCLUDE,
+    });
+
+    await this.recordStatusHistory(id, BookingStatus.CANCELLED, actorId, dto.reason);
+    this.audit(actorId, id, AuditAction.STATUS_CHANGE, { status: BookingStatus.CANCELLED, reason: dto.reason });
+    this.activityLog.log({
+      action: ActivityAction.BOOKING_CANCELLED,
+      module: ActivityModule.BOOKING,
+      description: `Booking ${booking.bookingRef ?? id} cancelled — ${booking.service.name}`,
+      actor: { id: actorId, name: 'Actor', role: actor?.role ?? Role.USER },
+      target: { id: booking.id, type: 'Booking' },
+      metadata: { bookingRef: booking.bookingRef, reason: dto.reason },
+    });
+
+    const notifyId = actorId === booking.customerId ? booking.workerId : booking.customerId;
+    if (notifyId) {
+      this.notifications.notify(notifyId, 'Booking Cancelled', `Booking for ${booking.service.name} has been cancelled.${dto.reason ? ' Reason: ' + dto.reason : ''}`, { bookingId: id }).catch(() => {});
+    }
+
+    return { success: true, message: 'Booking cancelled', data: updated };
+  }
+
+  // ─── No-show / Reschedule ─────────────────────────────────────────────────────
+
+  async markNoShow(id: string, actorId: string) {
+    const booking = await this.requireBookingWithService(id);
+    this.assertTransition(booking.status, BookingStatus.NO_SHOW);
+
+    const updated = await this.prisma.booking.update({
+      where: { id },
+      data: { status: BookingStatus.NO_SHOW },
+      include: BOOKING_INCLUDE,
+    });
+
+    await this.recordStatusHistory(id, BookingStatus.NO_SHOW, actorId);
+    this.audit(actorId, id, AuditAction.STATUS_CHANGE, { status: BookingStatus.NO_SHOW });
+
+    return { success: true, message: 'Booking marked as no-show', data: updated };
+  }
+
+  async reschedule(id: string, customerId: string, dto: RescheduleBookingDto) {
+    const booking = await this.requireBookingWithService(id);
+    this.assertOwner(booking, customerId);
+    this.assertNotTerminal(booking.status);
+    this.assertTransition(booking.status, BookingStatus.RESCHEDULED);
+
+    if (dto.scheduledAt < new Date()) throw new BadRequestException('Rescheduled date must be in the future');
+
+    if (dto.timeSlotId && dto.timeSlotId !== booking.timeSlotId) {
+      await this.validateAndClaimSlot(dto.timeSlotId, booking.serviceId);
+      if (booking.timeSlotId) await this.releaseSlot(booking.timeSlotId);
+    }
+
+    const updated = await this.prisma.booking.update({
+      where: { id },
+      data: {
+        status:      BookingStatus.RESCHEDULED,
+        scheduledAt: dto.scheduledAt,
+        timeSlotId:  dto.timeSlotId ?? booking.timeSlotId,
+        notes:       dto.reason ? `${booking.notes ?? ''}\n[Reschedule] ${dto.reason}`.trim() : booking.notes,
+      },
+      include: BOOKING_INCLUDE,
+    });
+
+    await this.recordStatusHistory(id, BookingStatus.RESCHEDULED, customerId, dto.reason);
+    this.audit(customerId, id, AuditAction.UPDATE, { scheduledAt: dto.scheduledAt });
+
+    if (booking.workerId) {
+      this.notifications.notify(booking.workerId, 'Booking Rescheduled', `A booking for ${booking.service.name} has been rescheduled to ${dto.scheduledAt.toISOString().slice(0, 10)}.`, { bookingId: id }).catch(() => {});
+    }
+
+    return { success: true, message: 'Booking rescheduled', data: updated };
+  }
+
+  // ─── Preview ──────────────────────────────────────────────────────────────────
+  // Pre-booking price breakdown — no persistence. servicePrice is read directly from the
+  // selected PricingOption, the exact same value create() charges, so the two can never drift.
+  async previewPrice(dto: PreviewBookingPriceDto) {
+    const pricingOption = await this.prisma.pricingOption.findUnique({
+      where: { id: dto.pricingOptionId },
+      select: { id: true, packageId: true, isActive: true, price: true },
+    });
+    if (!pricingOption) throw new NotFoundException('Pricing option not found');
+    if (pricingOption.packageId !== dto.packageId) {
+      throw new BadRequestException('Pricing option does not belong to the selected package');
+    }
+    if (!pricingOption.isActive) throw new BadRequestException('Pricing option is not available for booking');
+
+    const servicePrice = r2(pricingOption.price);
+    const { taxPercentage, advancePaymentPercentage } = await this.getOrgPaymentSettings();
+
+    const gst = r2((servicePrice * taxPercentage) / 100);
+    const total = r2(servicePrice + gst);
+    const advance = r2((total * advancePaymentPercentage) / 100);
+    const remaining = r2(total - advance);
+
+    return { success: true, data: { servicePrice, gst, total, advance, remaining } };
+  }
+
+  // ─── Payment (Booking Payment screen) ──────────────────────────────────────────
+  // Advance payment collected online at booking time — distinct from the worker's in-person
+  // cash/QR collection and from the post-COMPLETED formal invoice (InvoicesService.generateFromBooking).
+
+  async getPaymentConfig(bookingId: string, customerId: string) {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      include: { invoice: { include: { payments: { where: { status: 'SUCCESS' } } } } },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+    this.assertOwner(booking, customerId);
+
+    if (booking.invoice) {
+      const paid = r2(booking.invoice.payments.reduce((s, p) => s + p.amount, 0));
+      return {
+        success: true,
+        data: {
+          tax: booking.invoice.taxAmount,
+          advancePayment: booking.invoice.taxableAmount,
+          total: booking.invoice.total,
+          remaining: Math.max(0, r2(booking.invoice.total - paid)),
+        },
+      };
+    }
+
+    const advancePayment = r2(booking.advanceAmount ?? booking.totalAmount ?? 0);
+    const tax = r2((advancePayment * 18) / 100);
+    const total = r2(advancePayment + tax);
+    return { success: true, data: { tax, advancePayment, total, remaining: total } };
+  }
+
+  async createPaymentOrder(bookingId: string, customerId: string, paymentType: PaymentType, orgId?: string) {
+    const booking = await this.requireBookingWithService(bookingId);
+    this.assertOwner(booking, customerId);
+    if (booking.status !== BookingStatus.PENDING_PAYMENT) {
+      throw new BadRequestException('This booking is not awaiting payment');
+    }
+
+    const invoice = await this.invoicesService.ensureAdvanceInvoice(bookingId, customerId, paymentType);
+    const order = await this.paymentsService.createRazorpayOrder({ invoiceId: invoice.id, paymentType }, customerId, orgId);
+
+    // Reset payment tracking for this attempt (e.g. retrying after a previously failed/abandoned order).
+    await this.prisma.booking.update({
+      where: { id: bookingId },
+      data: { paymentStatus: PaymentStatus.CREATED, razorpayOrderId: order.data.razorpayOrderId },
+    });
+
+    return order;
+  }
+
+  // New simplified verify endpoint: POST /bookings/:id/payment/verify — takes only the three
+  // fields Razorpay returns (razorpay_payment_id, razorpay_order_id, razorpay_signature),
+  // identical whether they came from the Native SDK or Web Checkout — both hand the frontend
+  // the same three fields, so both go through this exact same verification logic with no
+  // branching. Resolves the internal Payment via its Transaction, so the caller never needs to
+  // know our internal paymentId. Booking only ever moves PENDING_PAYMENT → PENDING once the
+  // signature is verified SUCCESS; on failure/cancellation the booking stays PENDING_PAYMENT
+  // and paymentStatus is set FAILED.
+  async verifyBookingPayment(bookingId: string, dto: VerifyBookingPaymentDto, actor: AuthUser, orgId?: string) {
+    const booking = await this.requireBookingWithService(bookingId);
+    this.assertOwner(booking, actor.id);
+
+    const transaction = await this.prisma.transaction.findUnique({
+      where: { razorpayOrderId: dto.razorpay_order_id },
+      select: { paymentId: true, payment: { select: { invoice: { select: { bookingId: true } } } } },
+    });
+    if (!transaction || transaction.payment.invoice?.bookingId !== bookingId) {
+      throw new NotFoundException('Payment not found for this booking');
+    }
+
+    try {
+      const result = await this.paymentsService.verifyRazorpay(
+        {
+          paymentId: transaction.paymentId,
+          razorpayOrderId: dto.razorpay_order_id,
+          razorpayPaymentId: dto.razorpay_payment_id,
+          razorpaySignature: dto.razorpay_signature,
+        },
+        actor,
+        orgId,
+      );
+
+      const payment = result.data;
+      if (!payment) throw new NotFoundException('Payment not found');
+      const shouldAdvance = booking.status === BookingStatus.PENDING_PAYMENT;
+
+      const updated = await this.prisma.booking.update({
+        where: { id: bookingId },
+        data: {
+          ...(shouldAdvance && { status: BookingStatus.PENDING }),
+          paymentStatus: PaymentStatus.SUCCESS,
+          razorpayOrderId: dto.razorpay_order_id,
+          razorpayPaymentId: dto.razorpay_payment_id,
+          razorpaySignature: dto.razorpay_signature,
+          paidAmount: payment.paidAmount ?? payment.amount,
+          paidAt: payment.paidAt ?? new Date(),
+          paymentMethod: PaymentMethod.RAZORPAY,
+        },
+        include: BOOKING_INCLUDE,
+      });
+
+      if (shouldAdvance) {
+        await this.recordStatusHistory(bookingId, BookingStatus.PENDING, actor.id, 'Payment verified — awaiting manager confirmation');
+        this.audit(actor.id, bookingId, AuditAction.STATUS_CHANGE, { status: BookingStatus.PENDING, reason: 'payment' });
+        this.notifications
+          .notify(booking.customerId, 'Payment Successful', `Payment received for your booking for ${booking.service.name}.`, { bookingId })
+          .catch(() => {});
+      }
+
+      return {
+        success: true,
+        message: shouldAdvance ? 'Payment verified successfully' : 'Payment verified',
+        data: { payment: result.data, booking: updated },
+      };
+    } catch (err) {
+      // Signature invalid, already-processed, etc. — booking stays exactly where it was;
+      // only paymentStatus reflects the failed attempt.
+      await this.prisma.booking.update({
+        where: { id: bookingId },
+        data: {
+          paymentStatus: PaymentStatus.FAILED,
+          razorpayOrderId: dto.razorpay_order_id,
+          razorpayPaymentId: dto.razorpay_payment_id,
+          razorpaySignature: dto.razorpay_signature,
+        },
+      });
+      throw err;
+    }
+  }
+
+  async verifyPaymentAndConfirm(bookingId: string, dto: VerifyRazorpayDto, actor: AuthUser, orgId?: string) {
+    const booking = await this.requireBookingWithService(bookingId);
+    this.assertOwner(booking, actor.id);
+
+    const result = await this.paymentsService.verifyRazorpay(dto, actor, orgId);
+
+    if (booking.status === BookingStatus.PENDING_PAYMENT) {
+      const updated = await this.prisma.booking.update({
+        where: { id: bookingId },
+        data: { status: BookingStatus.PENDING, paymentStatus: PaymentStatus.SUCCESS },
+        include: BOOKING_INCLUDE,
+      });
+      await this.recordStatusHistory(bookingId, BookingStatus.PENDING, actor.id, 'Payment verified — awaiting manager confirmation');
+      this.audit(actor.id, bookingId, AuditAction.STATUS_CHANGE, { status: BookingStatus.PENDING, reason: 'payment' });
+      this.notifications
+        .notify(booking.customerId, 'Payment Successful', `Payment received for your booking for ${booking.service.name}.`, { bookingId })
+        .catch(() => {});
+      return { success: true, message: 'Payment verified successfully', data: { payment: result.data, booking: updated } };
+    }
+
+    return { success: true, message: 'Payment verified', data: { payment: result.data, booking } };
+  }
+
+  // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+  private buildWhere(filters: {
+    status?: BookingStatus;
+    customerId?: string;
+    workerId?: string;
+    managerId?: string;
+    serviceId?: string;
+    scheduledFrom?: Date;
+    scheduledTo?: Date;
+  }): Prisma.BookingWhereInput {
+    const where: Prisma.BookingWhereInput = {};
+    if (filters.status)     where.status     = filters.status;
+    if (filters.customerId) where.customerId  = filters.customerId;
+    if (filters.workerId)   where.workerId    = filters.workerId;
+    if (filters.managerId)  where.managerId   = filters.managerId;
+    if (filters.serviceId)  where.serviceId   = filters.serviceId;
+    if (filters.scheduledFrom || filters.scheduledTo) {
+      where.scheduledAt = {};
+      if (filters.scheduledFrom) where.scheduledAt.gte = filters.scheduledFrom;
+      if (filters.scheduledTo)   where.scheduledAt.lte = filters.scheduledTo;
+    }
+    return where;
+  }
+
+  private async requireBooking(id: string): Promise<Booking> {
+    const booking = await this.prisma.booking.findUnique({ where: { id } });
+    if (!booking) throw new NotFoundException('Booking not found');
+    return booking;
+  }
+
+  private async requireBookingWithService(id: string) {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id },
+      include: { service: { select: { id: true, name: true } } },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+    return booking;
+  }
+
+  private assertTransition(from: BookingStatus, to: BookingStatus): void {
+    const allowed = ALLOWED_TRANSITIONS[from] ?? [];
+    if (!allowed.includes(to)) {
+      throw new BadRequestException(`Cannot transition booking from ${from} to ${to}`);
+    }
+  }
+
+  private assertNotTerminal(status: BookingStatus): void {
+    if (TERMINAL_STATUSES.includes(status)) {
+      throw new BadRequestException(`Booking is already in a terminal state: ${status}`);
+    }
+  }
+
+  private assertOwner(booking: { customerId: string }, userId: string): void {
+    if (booking.customerId !== userId) throw new ForbiddenException('This booking does not belong to you');
+  }
+
+  private async recordStatusHistory(
+    bookingId: string,
+    status: BookingStatus,
+    actorId?: string,
+    note?: string,
+  ): Promise<void> {
+    await this.prisma.bookingStatusHistory.create({ data: { bookingId, status, actorId, note } });
+  }
+
+  private async getOrgPaymentSettings(): Promise<{ taxPercentage: number; advancePaymentPercentage: number }> {
+    const rows = await this.prisma.systemSetting.findMany({
+      where: { key: { in: [SETTING_KEYS.taxPercentage, SETTING_KEYS.advancePaymentPercentage] } },
+      select: { key: true, value: true },
+    });
+    const map = new Map(rows.map((r) => [r.key, Number(r.value)]));
+    return {
+      taxPercentage: map.get(SETTING_KEYS.taxPercentage) ?? DEFAULTS.taxPercentage,
+      advancePaymentPercentage: map.get(SETTING_KEYS.advancePaymentPercentage) ?? DEFAULTS.advancePaymentPercentage,
+    };
+  }
+
+  private async validateAndClaimSlot(timeSlotId: string, serviceId: string): Promise<void> {
+    const slot = await this.prisma.timeSlot.findUnique({
+      where: { id: timeSlotId },
+      select: { id: true, serviceId: true, isAvailable: true, capacity: true, _count: { select: { bookings: true } } },
+    });
+    if (!slot) throw new NotFoundException('Time slot not found');
+    if (slot.serviceId !== serviceId) throw new BadRequestException('Time slot does not belong to the selected service');
+    if (!slot.isAvailable) throw new BadRequestException('Time slot is not available');
+    if (slot._count.bookings >= slot.capacity) throw new BadRequestException('Time slot is fully booked');
+  }
+
+  private async releaseSlot(timeSlotId: string): Promise<void> {
+    const slot = await this.prisma.timeSlot.findUnique({
+      where: { id: timeSlotId },
+      select: { id: true, capacity: true, isAvailable: true, _count: { select: { bookings: true } } },
+    });
+    if (!slot) return;
+    if (!slot.isAvailable && slot._count.bookings <= slot.capacity) {
+      await this.prisma.timeSlot.update({ where: { id: timeSlotId }, data: { isAvailable: true } });
+    }
+  }
+
+  private async generateRef(): Promise<string> {
+    const count = await this.prisma.booking.count();
+    return `BK-${String(count + 1).padStart(6, '0')}`;
+  }
+
+  private audit(actorId: string, entityId: string, action: AuditAction, newValue?: unknown) {
+    this.auditLogs
+      .log({ actorId, entityType: 'Booking', entityId, action, newValue: newValue as Record<string, unknown> })
+      .catch(() => {});
+  }
+}

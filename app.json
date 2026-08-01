@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "c08450f7-e1ef-4229-800e-f97f711075dd"
+      }
+    },
+    "android": {
+      "package": "com.sahil0312.ziclobackend"
+    }
+  }
+}

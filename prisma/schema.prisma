@@ -1,0 +1,2124 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum Role {
+  USER
+  WORKER
+  MANAGER
+  ADMIN
+  SUPER_ADMIN // platform-level administrator
+  ORGANIZATION_ADMIN // org-level administrator (alias for ADMIN in tenant context)
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+  EXPIRED
+}
+
+enum PlanTier {
+  TRIAL
+  BASIC
+  PRO
+  ENTERPRISE
+}
+
+enum SalaryType {
+  SALARY
+  COMMISSION
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+// Distinct from SalaryType (used by WorkerProfile) — Manager's employment type uses MONTHLY
+// rather than SALARY, so it gets its own enum instead of overloading the shared one.
+enum ManagerEmploymentType {
+  MONTHLY
+  COMMISSION
+}
+
+enum PaymentCycle {
+  MONTHLY
+  WEEKLY
+}
+
+enum PaymentType {
+  ADVANCE
+  FULL
+}
+
+enum CommissionType {
+  PERCENT
+  FIXED
+}
+
+enum WorkShift {
+  MORNING
+  AFTERNOON
+  NIGHT
+}
+
+enum AttendanceStatus {
+  CHECKED_IN
+  CHECKED_OUT
+  PENDING_CHECKOUT
+  PRESENT
+  HALF_DAY
+  ABSENT
+}
+
+enum CheckoutStatus {
+  MANUAL
+  MISSED_REQUEST
+}
+
+enum MissedCheckoutRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum MissedCheckoutApprovalLevel {
+  MANAGER
+  ADMIN
+}
+
+enum PhotoType {
+  CHECKIN
+  CHECKOUT
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TaskStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED_PENDING_APPROVAL
+  COMPLETED
+}
+
+enum TaskPhotoType {
+  BEFORE
+  AFTER
+}
+
+enum DevicePlatform {
+  MOBILE
+  WEB
+}
+
+enum LeaveType {
+  SICK
+  CASUAL
+  PLANNED
+  // Not governed by LeavePolicy — no allocation/balance exists for this type; requests of
+  // this type bypass the balance check entirely (kept for backward compatibility with the
+  // existing worker leave-request flow).
+  EMERGENCY
+}
+
+enum LeaveRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum LeaveApprovalLevel {
+  MANAGER
+  ADMIN
+}
+
+// LeaveTransaction ledger entry kinds — ALLOCATION/CARRY_FORWARD/RESET are system-generated
+// by the two cron jobs below; DEDUCTION/REFUND come from a worker applying for or cancelling
+// a leave request.
+enum LeaveTransactionType {
+  ALLOCATION
+  CARRY_FORWARD
+  RESET
+  DEDUCTION
+  REFUND
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  STATUS_CHANGE
+  ROLE_CHANGE
+  ASSIGN
+  LOGIN
+  LOGOUT
+  CHECK_IN
+  CHECK_OUT
+}
+
+enum OtpType {
+  SMS
+  EMAIL
+}
+
+enum BookingStatus {
+  PENDING_PAYMENT // created, awaiting Razorpay verification — not yet paid
+  PENDING         // paid, awaiting manager confirmation
+  CONFIRMED
+  ASSIGNED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  RESCHEDULED
+  NO_SHOW
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  PROPOSAL_SENT
+  WON
+  LOST
+}
+
+enum DealStage {
+  PROSPECTING
+  QUALIFICATION
+  PROPOSAL
+  NEGOTIATION
+  CLOSED_WON
+  CLOSED_LOST
+}
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PAID
+  PARTIALLY_PAID
+  OVERDUE
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  UPI
+  BANK_TRANSFER
+  RAZORPAY
+}
+
+enum PaymentStatus {
+  CREATED
+  PENDING
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+enum TransactionStatus {
+  CREATED
+  ATTEMPTED
+  PAID
+  FAILED
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+enum TicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+  URGENT
+}
+
+enum IssueType {
+  BOOKING
+  OTHER
+}
+
+enum ActivityType {
+  CALL
+  EMAIL
+  MEETING
+  NOTE
+  TASK_COMPLETED
+}
+
+enum PushDeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
+// ─── Dynamic Booking Engine Enums ─────────────────────────────────────────────
+
+enum AddressType {
+  HOME
+  OFFICE
+  OTHER
+}
+
+// ─── Models ───────────────────────────────────────────────────────────────────
+
+model User {
+  id             String        @id @default(uuid())
+  name           String
+  email          String        @unique
+  phone          String        @unique
+  password       String
+  role           Role          @default(USER)
+  profileImage   String?
+  isActive       Boolean       @default(true)
+  emailVerified  Boolean       @default(false)
+  phoneVerified  Boolean       @default(false)
+  organizationId String?
+  organization   Organization? @relation("OrgUsers", fields: [organizationId], references: [id])
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  addresses           Address[]
+  workerProfile       WorkerProfile?
+  managerProfile      ManagerProfile?
+  attendances         Attendance[]
+  createdTasks        Task[]               @relation("CreatedTasks")
+  managedTasks        Task[]               @relation("ManagerTasks")
+  assignedTasks       Task[]               @relation("WorkerTasks")
+  refreshTokens       RefreshToken[]
+  passwordResetTokens PasswordResetToken[]
+  deviceTokens        DeviceToken[]
+  notifications       Notification[]
+  auditLogs           AuditLog[]           @relation("AuditLogActor")
+
+  assignedLeads Lead[] @relation("LeadAssignee")
+  createdLeads  Lead[] @relation("LeadCreator")
+  assignedDeals Deal[] @relation("DealAssignee")
+  createdDeals  Deal[] @relation("DealCreator")
+
+  customerBookings Booking[] @relation("CustomerBookings")
+  workerBookings   Booking[] @relation("WorkerBookings")
+  managerBookings  Booking[] @relation("ManagerBookings")
+  createdBookings  Booking[] @relation("CreatedBookings")
+
+  customerInvoices Invoice[] @relation("CustomerInvoices")
+  createdInvoices  Invoice[] @relation("CreatedInvoices")
+
+  orgMemberships OrganizationUser[]
+
+  createdTickets         SupportTicket[]        @relation("CreatedTickets")
+  assignedTickets        SupportTicket[]        @relation("AssignedTickets")
+  customerSupportTickets SupportTicket[]        @relation("CustomerSupportTickets")
+  ticketComments         TicketComment[]        @relation("TicketComments")
+  ticketAttachments      TicketAttachment[]     @relation("TicketAttachments")
+  ticketEscalations      TicketEscalation[]     @relation("TicketEscalations")
+  activities             Activity[]             @relation("ActivitiesPerformed")
+  bookingStatusHistory   BookingStatusHistory[] @relation("StatusHistoryActor")
+
+  attendanceApprovals            Attendance[]            @relation("AttendanceApprovedBy")
+  missedCheckoutRequests         MissedCheckoutRequest[] @relation("MissedCheckoutRequestedBy")
+  missedCheckoutAsManager        MissedCheckoutRequest[] @relation("MissedCheckoutManager")
+  missedCheckoutManagerDecisions MissedCheckoutRequest[] @relation("MissedCheckoutManagerDecider")
+  missedCheckoutAdminDecisions   MissedCheckoutRequest[] @relation("MissedCheckoutAdminDecider")
+
+  leaveRequests                WorkerLeaveRequest[] @relation("WorkerLeaveRequester")
+  leaveRequestsAsManager       WorkerLeaveRequest[] @relation("LeaveRequestManager")
+  leaveRequestManagerDecisions WorkerLeaveRequest[] @relation("LeaveRequestManagerDecider")
+  leaveRequestAdminDecisions   WorkerLeaveRequest[] @relation("LeaveRequestAdminDecider")
+
+  leaveBalance      LeaveBalance?
+  leaveTransactions LeaveTransaction[] @relation("LeaveTransactions")
+
+  savedPaymentMethods SavedPaymentMethod[]
+
+  @@index([organizationId])
+}
+
+model Address {
+  id              String      @id @default(uuid())
+  userId          String
+  user            User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label           String
+  fullName        String?
+  mobile          String?
+  alternateMobile String?
+  houseNo         String?
+  street          String?
+  landmark        String?
+  city            String
+  state           String
+  pincode         String
+  latitude        Float
+  longitude       Float
+  additionalNote  String?
+  addressType     AddressType @default(HOME)
+  isDefault       Boolean     @default(false)
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  bookings Booking[]
+
+  @@index([userId])
+}
+
+model Area {
+  id        String   @id @default(uuid())
+  name      String
+  pincode   String
+  city      String
+  district  String?
+  state     String
+  country   String   @default("India")
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  officeLocations OfficeLocation[]
+  managerAreas    ManagerArea[]
+  workerProfiles  WorkerProfile[]
+  tasks           Task[]
+
+  @@unique([name, pincode])
+  @@index([pincode])
+  @@index([isActive])
+}
+
+model OfficeLocation {
+  id        String   @id @default(uuid())
+  name      String
+  address   String?
+  latitude  Float
+  longitude Float
+  radius    Int
+  isActive  Boolean  @default(true)
+  areaId    String?
+  area      Area?    @relation(fields: [areaId], references: [id], onDelete: SetNull)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  attendances        Attendance[]
+  managerProfiles    ManagerProfile[]
+  managerAssignments ManagerOfficeLocation[]
+
+  @@index([areaId])
+  @@index([isActive])
+}
+
+model ManagerProfile {
+  id                String                 @id @default(uuid())
+  userId            String                 @unique
+  user              User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  employeeCode      String                 @unique
+  faceImage         String?
+  gender            Gender?
+  dateOfBirth       DateTime?
+  address           String?
+  aadhaarNumber     String?
+  aadhaarImage      String? // legacy single-image field — kept for backward compatibility, superseded by aadhaarFrontImage/aadhaarBackImage
+  aadhaarFrontImage String?
+  aadhaarBackImage  String?
+  panNumber         String?
+  panImage          String?
+  officeLocationId  String?
+  officeLocation    OfficeLocation?        @relation(fields: [officeLocationId], references: [id])
+  shift             WorkShift? // legacy enum — kept for backward compatibility, superseded by shiftId
+  shiftId           String?
+  shiftRef          Shift?                 @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  salaryType        SalaryType
+  salaryAmount      Float?
+  commissionPercent Float?
+  // Additive — separate from the legacy salaryType/salaryAmount/commissionPercent above
+  // (which stay untouched for backward compatibility). MONTHLY employmentType requires
+  // monthlySalary > 0; COMMISSION does not use monthlySalary.
+  employmentType    ManagerEmploymentType?
+  monthlySalary     Decimal?               @db.Decimal(12, 2)
+  bankAccountHolder String?
+  bankName          String?
+  bankBranch        String?
+  bankAccountNumber String?
+  bankIfsc          String?
+  upiId             String?
+  remarks           String?
+  createdAt         DateTime               @default(now())
+  updatedAt         DateTime               @updatedAt
+
+  areas           ManagerArea[]
+  pincodes        ManagerPincode[]
+  officeLocations ManagerOfficeLocation[]
+
+  @@index([officeLocationId])
+  @@index([shiftId])
+}
+
+model ManagerArea {
+  id        String         @id @default(uuid())
+  managerId String
+  areaId    String
+  manager   ManagerProfile @relation(fields: [managerId], references: [id], onDelete: Cascade)
+  area      Area           @relation(fields: [areaId], references: [id], onDelete: Cascade)
+  createdAt DateTime       @default(now())
+
+  @@unique([managerId, areaId])
+  @@index([managerId])
+  @@index([areaId])
+}
+
+// One manager can be assigned to multiple office locations (in addition to the legacy
+// single ManagerProfile.officeLocationId, kept for backward compatibility).
+model ManagerOfficeLocation {
+  id               String         @id @default(uuid())
+  managerId        String
+  officeLocationId String
+  manager          ManagerProfile @relation(fields: [managerId], references: [id], onDelete: Cascade)
+  officeLocation   OfficeLocation @relation(fields: [officeLocationId], references: [id], onDelete: Cascade)
+  createdAt        DateTime       @default(now())
+
+  @@unique([managerId, officeLocationId])
+  @@index([managerId])
+  @@index([officeLocationId])
+}
+
+model Pincode {
+  id         String   @id @default(uuid())
+  pincode    String   @unique
+  officeName String?
+  city       String
+  district   String?
+  state      String
+  country    String   @default("India")
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  managerPincodes ManagerPincode[]
+  workerProfiles  WorkerProfile[]
+  tasks           Task[]
+
+  @@index([pincode])
+  @@index([city])
+  @@index([district])
+  @@index([state])
+  @@index([isActive])
+}
+
+model ManagerPincode {
+  id        String         @id @default(uuid())
+  managerId String
+  pincodeId String
+  manager   ManagerProfile @relation(fields: [managerId], references: [id], onDelete: Cascade)
+  pincode   Pincode        @relation(fields: [pincodeId], references: [id], onDelete: Cascade)
+  createdAt DateTime       @default(now())
+
+  @@unique([managerId, pincodeId])
+  @@index([managerId])
+  @@index([pincodeId])
+}
+
+model WorkerProfile {
+  id                String             @id @default(uuid())
+  userId            String             @unique
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  employeeCode      String             @unique
+  gender            Gender?
+  dateOfBirth       DateTime?
+  address           String?
+  aadhaarNumber     String?            @unique
+  panNumber         String?            @unique
+  aadhaarImage      String? // legacy single-image field — kept for backward compatibility, superseded by aadhaarFrontImage/aadhaarBackImage
+  panImage          String?
+  faceImage         String?
+  // salaryType doubles as "employmentType" (SALARY | COMMISSION) — no separate column added,
+  // it already models the same concept this field name is used for in the Manager Worker APIs.
+  salaryType        SalaryType
+  // salaryAmount doubles as "monthlySalary" in the Manager Worker APIs — same underlying column.
+  salaryAmount      Float?
+  commissionPercent Float? // legacy — superseded by the WorkerCommission table (per-service commissions)
+  aadhaarFrontImage String?
+  aadhaarBackImage  String?
+  paymentCycle      PaymentCycle?
+  joiningDate       DateTime?
+  accountHolderName String?
+  bankName          String?
+  accountNumber     String?
+  ifscCode          String?
+  branchName        String?
+  upiId             String?
+  remark            String?
+  areaId            String?
+  area              Area?              @relation(fields: [areaId], references: [id])
+  pincodeId         String?
+  pincode           Pincode?           @relation(fields: [pincodeId], references: [id])
+  shiftId           String?
+  shiftRef          Shift?             @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  commissions       WorkerCommission[]
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  @@index([areaId])
+  @@index([pincodeId])
+  @@index([shiftId])
+}
+
+model WorkerLeaveRequest {
+  id       String    @id @default(uuid())
+  workerId String
+  worker   User      @relation("WorkerLeaveRequester", fields: [workerId], references: [id], onDelete: Cascade)
+  date     DateTime
+  type     LeaveType
+  reason   String
+
+  status    LeaveRequestStatus @default(PENDING)
+  appliedAt DateTime           @default(now())
+
+  // Resolved automatically from the worker's assigned area at apply time (same resolution
+  // WorkerService.getReportingManager / AttendanceService.resolveManagerUserId use). Null if
+  // the worker has no assigned area/manager.
+  managerId   String?
+  managerUser User?   @relation("LeaveRequestManager", fields: [managerId], references: [id])
+
+  currentLevel          LeaveApprovalLevel @default(MANAGER)
+  // Snapshot of LeavePolicy.requireAdminLeaveApproval taken at apply time, so a later policy
+  // change can't alter an already in-flight request's escalation path.
+  adminApprovalRequired Boolean            @default(false)
+
+  managerDecision      LeaveRequestStatus?
+  managerDecidedById   String?
+  managerDecidedByUser User?               @relation("LeaveRequestManagerDecider", fields: [managerDecidedById], references: [id])
+  managerDecidedAt     DateTime?
+  managerRemark        String?
+
+  adminDecision      LeaveRequestStatus?
+  adminDecidedById   String?
+  adminDecidedByUser User?               @relation("LeaveRequestAdminDecider", fields: [adminDecidedById], references: [id])
+  adminDecidedAt     DateTime?
+  adminRemark        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([workerId])
+  @@index([managerId])
+  @@index([status])
+  @@index([date])
+}
+
+// Singleton, admin-editable configuration for the whole Leave Policy system — the single
+// source of truth for allocation amounts, carry-forward rules, and financial-year reset
+// behavior for each of the three policy-governed leave types (Casual / Sick / Planned).
+// Nothing about leave rules is hardcoded in code; the monthly allocation job and financial
+// year reset job (LeavePolicyCronService) read every number/flag used below from this row.
+model LeavePolicy {
+  id String @id @default("singleton")
+
+  // 1-12 (e.g. April=4, March=3) — defines the financial year window used by the FY reset job.
+  financialYearStartMonth Int @default(4)
+  financialYearEndMonth   Int @default(3)
+
+  // ── Casual Leave ──────────────────────────────────────────────────────────────
+  casualMonthlyAllocation   Float   @default(1)
+  casualCarryForwardEnabled Boolean @default(true)
+  casualCarryForwardLimit   Float? // null = unlimited
+  casualFinancialYearReset  Boolean @default(true)
+  casualEnabled             Boolean @default(true)
+
+  // ── Sick Leave ────────────────────────────────────────────────────────────────
+  sickYearlyAllocation    Float   @default(6)
+  sickCarryForwardEnabled Boolean @default(false)
+  sickCarryForwardLimit   Float?
+  sickFinancialYearReset  Boolean @default(true)
+  sickEnabled             Boolean @default(true)
+
+  // ── Planned Leave ─────────────────────────────────────────────────────────────
+  plannedMonthlyAllocation   Float   @default(3)
+  plannedCarryForwardEnabled Boolean @default(true)
+  plannedCarryForwardLimit   Float? // null = unlimited
+  plannedFinancialYearReset  Boolean @default(false)
+  plannedEnabled             Boolean @default(true)
+
+  // Worker → Manager Approval → (Optional) Admin Approval — when true, every manager
+  // approval escalates to an admin instead of finalizing (mirrors
+  // AttendanceRule.requireAdminAttendanceApproval for missed checkouts).
+  requireAdminLeaveApproval Boolean @default(false)
+
+  // Idempotency guards so the scheduled cron and an admin-triggered manual run (same API)
+  // never double-allocate/double-reset within the same period.
+  lastMonthlyAllocationRunMonth String? // "YYYY-MM" of the last successful monthly run
+  lastFinancialYearResetRunYear Int? // financial-year start-year of the last successful reset
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Every WORKER and MANAGER gets one row — running available/used totals per leave type,
+// updated by the cron jobs (allocation/reset) and by leave-request apply/cancel (deduction/
+// refund). LeaveTransaction below is the append-only audit trail behind these running totals.
+model LeaveBalance {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // "Allocated" — gross running total ever credited (monthly/yearly allocation + carry
+  // forward). Never decremented directly by usage; "remaining" (allocated - used) is what
+  // apply/cancel actually checks and mutates via `used` below. Exposed to the API as
+  // `available` per the Leave Balance spec (Available / Used / Remaining).
+  casualAllocated  Float @default(0)
+  casualUsed       Float @default(0)
+  sickAllocated    Float @default(0)
+  sickUsed         Float @default(0)
+  plannedAllocated Float @default(0)
+  plannedUsed      Float @default(0)
+
+  // Days recorded as an unpaid absence (missed checkout that was never resolved to
+  // PRESENT/HALF_DAY, or a rejected missed-checkout request) — reversed if a later approval
+  // converts the day to PRESENT/HALF_DAY.
+  lwpUsed Float @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+// Append-only ledger — every allocation, carry-forward, reset, deduction, and refund is
+// recorded here, giving GET /admin/leave-policy/transactions a complete, reconstructable
+// history per employee instead of only the current LeaveBalance snapshot.
+model LeaveTransaction {
+  id              String               @id @default(uuid())
+  userId          String
+  user            User                 @relation("LeaveTransactions", fields: [userId], references: [id], onDelete: Cascade)
+  leaveType       LeaveType
+  transactionType LeaveTransactionType
+  amount          Float // positive = credit (allocation/carry-forward/refund), negative = debit (deduction)
+  balanceAfter    Float // available balance for leaveType immediately after this entry
+  note            String?
+  createdAt       DateTime             @default(now())
+
+  @@index([userId])
+  @@index([leaveType])
+  @@index([createdAt])
+}
+
+// Per-service commission rates for COMMISSION-type workers (one worker, many services).
+model WorkerCommission {
+  id              String         @id @default(uuid())
+  workerId        String
+  worker          WorkerProfile  @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  serviceId       String
+  service         Service        @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  commissionType  CommissionType
+  commissionValue Float
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@unique([workerId, serviceId])
+  @@index([workerId])
+  @@index([serviceId])
+}
+
+// Admin-managed shift definitions (Admin → Profile → Attendance Rules). Additive: existing
+// ManagerProfile.shift (WorkShift enum) is untouched for backward compatibility; shiftId on
+// ManagerProfile/WorkerProfile is the new, real per-shift configuration going forward.
+model Shift {
+  id                String   @id @default(uuid())
+  name              String   @unique
+  startTime         String // "HH:mm"
+  endTime           String // "HH:mm"
+  graceMinutes      Int      @default(0)
+  halfDayHours      Float
+  fullDayHours      Float
+  lateAfterMinutes  Int      @default(0)
+  earlyLeaveMinutes Int      @default(0)
+  workingDays       Int[] // 0 = Sunday .. 6 = Saturday
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  managerProfiles ManagerProfile[]
+  workerProfiles  WorkerProfile[]
+
+  @@index([isActive])
+}
+
+model Attendance {
+  id                String           @id @default(uuid())
+  userId            String
+  user              User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  officeLocationId  String
+  officeLocation    OfficeLocation   @relation(fields: [officeLocationId], references: [id])
+  checkInTime       DateTime
+  checkOutTime      DateTime?
+  checkInLatitude   Float
+  checkInLongitude  Float
+  checkOutLatitude  Float?
+  checkOutLongitude Float?
+  status            AttendanceStatus @default(CHECKED_IN)
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+
+  checkoutStatus CheckoutStatus @default(MANUAL)
+  // Set by the Missed Checkout Detection job (or the same check run lazily on read) the moment
+  // an OPEN attendance row is past its shift-end deadline — status is set to ABSENT in the same
+  // write. Distinguishes "ABSENT because checkout was missed" (eligible for the missed-checkout
+  // request/approval flow) from any other ABSENT row.
+  missedCheckout Boolean        @default(false)
+  approvedBy     String?
+  approvedByUser User?          @relation("AttendanceApprovedBy", fields: [approvedBy], references: [id])
+  approvedAt     DateTime?
+  approvalRemark String?
+
+  photos                AttendancePhoto[]
+  missedCheckoutRequest MissedCheckoutRequest?
+
+  @@index([organizationId])
+  @@index([userId])
+  @@index([officeLocationId])
+  @@index([checkInTime])
+  @@index([userId, checkInTime])
+  @@index([status])
+}
+
+model MissedCheckoutRequest {
+  id           String     @id @default(uuid())
+  attendanceId String     @unique
+  attendance   Attendance @relation(fields: [attendanceId], references: [id], onDelete: Cascade)
+
+  // Always the worker who owns the attendance record — set automatically at auto-creation
+  // time (see AttendanceService.markMissedCheckout), not chosen by whoever submits a reason.
+  requestedById   String
+  requestedByUser User   @relation("MissedCheckoutRequestedBy", fields: [requestedById], references: [id])
+
+  // Resolved automatically from the worker's assigned area at auto-creation time (same
+  // resolution WorkerService.getReportingManager uses). Null for a manager's own missed
+  // checkout (no manager to notify — it goes straight to ADMIN).
+  managerId   String?
+  managerUser User?   @relation("MissedCheckoutManager", fields: [managerId], references: [id])
+
+  // Both null at auto-creation — the worker fills these in afterward via
+  // POST workers/me/missed-checkout/:attendanceId (resubmit/edit while still PENDING).
+  reason                String?
+  note                  String?
+  imageUrl              String?
+  // The worker's own claimed check-out time — the default used to recalculate working hours
+  // on approval unless the approver explicitly overrides it (DecideMissedCheckoutRequestDto).
+  requestedCheckOutTime DateTime?
+
+  status                MissedCheckoutRequestStatus @default(PENDING)
+  currentLevel          MissedCheckoutApprovalLevel
+  // Snapshot of AttendanceRule.requireAdminAttendanceApproval (or forced true for a manager's
+  // own missed checkout) taken at auto-creation time, so a later policy change can't alter an
+  // already in-flight request's escalation path.
+  adminApprovalRequired Boolean                     @default(false)
+
+  managerDecision      MissedCheckoutRequestStatus?
+  managerDecidedById   String?
+  managerDecidedByUser User?                        @relation("MissedCheckoutManagerDecider", fields: [managerDecidedById], references: [id])
+  managerDecidedAt     DateTime?
+  managerRemark        String?
+
+  adminDecision      MissedCheckoutRequestStatus?
+  adminDecidedById   String?
+  adminDecidedByUser User?                        @relation("MissedCheckoutAdminDecider", fields: [adminDecidedById], references: [id])
+  adminDecidedAt     DateTime?
+  adminRemark        String?
+
+  approvedCheckOutTime DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([requestedById])
+  @@index([managerId])
+  @@index([status])
+  @@index([currentLevel])
+}
+
+model AttendancePhoto {
+  id           String     @id @default(uuid())
+  attendanceId String
+  attendance   Attendance @relation(fields: [attendanceId], references: [id], onDelete: Cascade)
+  type         PhotoType
+  imageUrl     String
+  createdAt    DateTime   @default(now())
+
+  @@index([attendanceId])
+}
+
+model Task {
+  id             String       @id @default(uuid())
+  title          String
+  description    String?
+  priority       TaskPriority @default(MEDIUM)
+  status         TaskStatus   @default(PENDING)
+  dueDate        DateTime
+  completionNote String?
+  completedAt    DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+
+  areaId    String?
+  area      Area?    @relation(fields: [areaId], references: [id])
+  pincodeId String?
+  pincode   Pincode? @relation(fields: [pincodeId], references: [id])
+
+  assignedManagerId String?
+  assignedManager   User?   @relation("ManagerTasks", fields: [assignedManagerId], references: [id])
+
+  assignedWorkerId String?
+  assignedWorker   User?   @relation("WorkerTasks", fields: [assignedWorkerId], references: [id])
+
+  createdById String
+  createdBy   User   @relation("CreatedTasks", fields: [createdById], references: [id])
+
+  photos TaskPhoto[]
+
+  @@index([organizationId])
+  @@index([status])
+  @@index([areaId])
+  @@index([pincodeId])
+  @@index([assignedManagerId])
+  @@index([assignedWorkerId])
+  @@index([dueDate])
+  @@index([createdAt])
+  @@index([status, dueDate])
+}
+
+model TaskPhoto {
+  id        String        @id @default(uuid())
+  taskId    String
+  task      Task          @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  imageUrl  String
+  type      TaskPhotoType
+  createdAt DateTime      @default(now())
+
+  @@index([taskId])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model DeviceToken {
+  id        String         @id @default(uuid())
+  userId    String
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String         @unique
+  platform  DevicePlatform
+  isActive  Boolean        @default(true)
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  @@index([userId])
+  @@index([userId, isActive])
+}
+
+// Booking lifecycle notification kinds — nullable on Notification so generic/admin-sent
+// pushes (send-push, test) aren't forced into one of these buckets.
+enum NotificationType {
+  BOOKING_CREATED
+  MANAGER_ASSIGNED
+  WORKER_ASSIGNED
+  WORKER_ACCEPTED
+  WORK_STARTED
+  WORK_COMPLETED
+}
+
+model Notification {
+  id         String             @id @default(uuid())
+  userId     String
+  user       User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type       NotificationType?
+  title      String
+  message    String
+  isRead     Boolean            @default(false)
+  data       Json?
+  pushStatus PushDeliveryStatus @default(PENDING)
+  pushSentAt DateTime?
+  pushError  String?
+  createdAt  DateTime           @default(now())
+
+  @@index([userId])
+  @@index([userId, isRead])
+  @@index([userId, pushStatus])
+  @@index([type])
+}
+
+model AuditLog {
+  id         String      @id @default(uuid())
+  actorId    String?
+  actor      User?       @relation("AuditLogActor", fields: [actorId], references: [id])
+  entityType String
+  entityId   String
+  action     AuditAction
+  oldValue   Json?
+  newValue   Json?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime    @default(now())
+
+  @@index([actorId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+// ─── Service Catalog ──────────────────────────────────────────────────────────
+
+model Service {
+  id          String  @id @default(uuid())
+  name        String
+  description String?
+  thumbnail   String?
+  banner      String?
+  isActive    Boolean @default(true)
+  // Reusable icon — iconUrl (custom uploaded icon) takes precedence over iconName (a name
+  // resolved against the frontend's local icon library) when both are present.
+  iconName    String?
+  iconUrl     String?
+
+  // Website-only grouping (Module 2) — nullable/additive, never selected by any existing
+  // Mobile App query, so this is fully backward compatible.
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  propertyTypes     PropertyType[]
+  timeSlots         TimeSlot[]
+  bookings          Booking[]
+  workerCommissions WorkerCommission[]
+
+  @@index([isActive])
+  @@index([categoryId])
+}
+
+// ─── Website — Module 2 (Website Services) ────────────────────────────────────
+// Website-only grouping for Service — the Mobile App has no concept of categories and never
+// queries this model or the new Service.categoryId field.
+model Category {
+  id           String    @id @default(uuid())
+  name         String
+  description  String?
+  image        String?
+  icon         String?
+  displayOrder Int       @default(0)
+  isActive     Boolean   @default(true)
+  deletedAt    DateTime?
+  createdBy    String?
+  updatedBy    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  services Service[]
+
+  @@index([isActive])
+  @@index([deletedAt])
+  @@index([displayOrder])
+}
+
+model PropertyType {
+  id           String   @id @default(uuid())
+  serviceId    String
+  service      Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  name         String
+  description  String?
+  displayOrder Int      @default(0)
+  isActive     Boolean  @default(true)
+  // Reusable icon — iconUrl (custom uploaded icon) takes precedence over iconName (a name
+  // resolved against the frontend's local icon library) when both are present.
+  iconName     String?
+  iconUrl      String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  packages Package[]
+  bookings Booking[]
+
+  @@index([serviceId])
+}
+
+model Package {
+  id              String       @id @default(uuid())
+  propertyTypeId  String
+  propertyType    PropertyType @relation(fields: [propertyTypeId], references: [id], onDelete: Cascade)
+  name            String
+  description     String?
+  price           Float
+  durationMinutes Int?
+  minPanels       Int?
+  maxPanels       Int?
+  displayOrder    Int          @default(0)
+  isActive        Boolean      @default(true)
+  // Reusable icon — iconUrl (custom uploaded icon) takes precedence over iconName (a name
+  // resolved against the frontend's local icon library) when both are present.
+  iconName        String?
+  iconUrl         String?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  bookings       Booking[]
+  pricingOptions PricingOption[]
+
+  @@index([propertyTypeId])
+}
+
+// A priced variant within a Package (e.g. Package "Basic" → "1 Unit" ₹399, "2 Units" ₹699,
+// "3 Units" ₹999; Package "One Time" → "1-3 KW" ₹499, "4-6 KW" ₹699). Replaces the removed
+// Service-level "Additional Selection" model — pricing now lives directly under the Package
+// it belongs to, and `price` is the full final price for that option (no base + adjustment).
+model PricingOption {
+  id           String   @id @default(uuid())
+  packageId    String
+  package      Package  @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  label        String
+  price        Float
+  displayOrder Int      @default(0)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  bookings Booking[]
+
+  @@index([packageId])
+}
+
+// ─── Booking Models ───────────────────────────────────────────────────────────
+
+model TimeSlot {
+  id          String   @id @default(uuid())
+  serviceId   String
+  service     Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  date        DateTime @db.Date
+  startTime   String
+  endTime     String
+  capacity    Int      @default(1)
+  isAvailable Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  bookings Booking[]
+
+  @@unique([serviceId, date, startTime])
+  @@index([serviceId])
+  @@index([date])
+  @@index([isAvailable])
+  @@index([serviceId, date, isAvailable])
+}
+
+model Booking {
+  id             String        @id @default(uuid())
+  bookingRef     String?       @unique // human-readable e.g. "BK-20240001"
+  status         BookingStatus @default(PENDING_PAYMENT)
+  notes          String?
+  cancelReason   String?
+  scheduledAt    DateTime
+  completedAt    DateTime?
+  cancelledAt    DateTime?
+  totalAmount    Float? // computed at booking creation
+  advanceAmount  Float? // amount to pay upfront
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+
+  serviceId  String
+  service    Service   @relation(fields: [serviceId], references: [id])
+  timeSlotId String?
+  timeSlot   TimeSlot? @relation(fields: [timeSlotId], references: [id])
+
+  propertyTypeId String
+  propertyType   PropertyType @relation(fields: [propertyTypeId], references: [id])
+  packageId      String
+  package        Package      @relation(fields: [packageId], references: [id])
+  packagePrice   Float? // Package.price locked at booking time
+
+  // The priced variant selected within the Package (e.g. "2 Units", "4-6 KW") — its `price`
+  // is what totalAmount is set from. SetNull (not Cascade) so deleting an option later never
+  // destroys booking history.
+  pricingOptionId String?
+  pricingOption   PricingOption? @relation(fields: [pricingOptionId], references: [id], onDelete: SetNull)
+
+  addressId String?
+  address   Address? @relation(fields: [addressId], references: [id])
+
+  customerId String
+  customer   User   @relation("CustomerBookings", fields: [customerId], references: [id])
+
+  workerId String?
+  worker   User?   @relation("WorkerBookings", fields: [workerId], references: [id])
+
+  managerId String?
+  manager   User?   @relation("ManagerBookings", fields: [managerId], references: [id])
+
+  createdById String
+  createdBy   User   @relation("CreatedBookings", fields: [createdById], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Worker job-flow fields (Worker Panel: accept / start / before-after photos / payment
+  // collection) — additive, do not affect the existing admin/manager booking lifecycle above.
+  workerAcceptedAt        DateTime?
+  workerStartAt           DateTime?
+  workerStartLatitude     Float?
+  workerStartLongitude    Float?
+  paymentCollectionMethod PaymentMethod?
+  paymentCollectedAt      DateTime?
+
+  // Online (Razorpay) payment tracking — set on order creation, updated on verification.
+  // Booking.status only ever moves PENDING → CONFIRMED once paymentStatus is verified SUCCESS.
+  paymentStatus     PaymentStatus  @default(CREATED)
+  razorpayOrderId   String?
+  razorpayPaymentId String?
+  razorpaySignature String?
+  paidAmount        Float?
+  paidAt            DateTime?
+  paymentMethod     PaymentMethod?
+
+  invoice        Invoice?
+  statusHistory  BookingStatusHistory[]
+  supportTickets SupportTicket[]        @relation("TicketBooking")
+  photos         BookingPhoto[]
+
+  @@index([status])
+  @@index([organizationId])
+  @@index([customerId])
+  @@index([workerId])
+  @@index([managerId])
+  @@index([serviceId])
+  @@index([propertyTypeId])
+  @@index([packageId])
+  @@index([pricingOptionId])
+  @@index([scheduledAt])
+  @@index([createdAt])
+  @@index([addressId])
+  @@index([status, scheduledAt])
+}
+
+model BookingPhoto {
+  id        String        @id @default(uuid())
+  bookingId String
+  booking   Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  imageUrl  String
+  type      TaskPhotoType // reused: BEFORE / AFTER — same semantics as Task's before/after photos
+  latitude  Float?
+  longitude Float?
+  createdAt DateTime      @default(now())
+
+  @@index([bookingId])
+}
+
+model BookingStatusHistory {
+  id        String        @id @default(uuid())
+  bookingId String
+  booking   Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  status    BookingStatus
+  note      String?
+  actorId   String?
+  actor     User?         @relation("StatusHistoryActor", fields: [actorId], references: [id])
+  createdAt DateTime      @default(now())
+
+  @@index([bookingId])
+  @@index([createdAt])
+}
+
+// ─── Invoicing Models ─────────────────────────────────────────────────────────
+
+model Invoice {
+  id            String        @id @default(uuid())
+  invoiceNumber String        @unique
+  status        InvoiceStatus @default(DRAFT)
+
+  customerId  String
+  customer    User     @relation("CustomerInvoices", fields: [customerId], references: [id])
+  bookingId   String?  @unique
+  booking     Booking? @relation(fields: [bookingId], references: [id])
+  createdById String
+  createdBy   User     @relation("CreatedInvoices", fields: [createdById], references: [id])
+
+  subtotal       Float @default(0)
+  discountAmount Float @default(0)
+  taxableAmount  Float @default(0)
+  cgst           Float @default(0)
+  sgst           Float @default(0)
+  igst           Float @default(0)
+  taxAmount      Float @default(0)
+  total          Float @default(0)
+
+  gstRate      Float   @default(18)
+  gstNumber    String?
+  isInterState Boolean @default(false)
+
+  notes   String?
+  dueDate DateTime?
+  sentAt  DateTime?
+  paidAt  DateTime?
+
+  pdfUrl         String?
+  pdfGeneratedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items    InvoiceItem[]
+  payments Payment[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([dueDate])
+  @@index([createdAt])
+}
+
+model InvoiceItem {
+  id          String   @id @default(uuid())
+  invoiceId   String
+  invoice     Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  description String
+  quantity    Float
+  unitPrice   Float
+  taxRate     Float    @default(0)
+  amount      Float
+  createdAt   DateTime @default(now())
+
+  @@index([invoiceId])
+}
+
+model Payment {
+  id        String        @id @default(uuid())
+  invoiceId String
+  invoice   Invoice       @relation(fields: [invoiceId], references: [id])
+  amount    Float
+  method    PaymentMethod
+  status    PaymentStatus @default(PENDING)
+  notes     String?
+  paidAt    DateTime?
+
+  // Set on Razorpay order creation (ADVANCE vs FULL); paidAmount/remainingAmount are
+  // computed and stored once the payment is verified successfully.
+  paymentType      PaymentType?
+  paidAmount       Float?
+  remainingAmount  Float?
+
+  transactions Transaction[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([invoiceId])
+  @@index([status])
+}
+
+// Lightweight record of a customer's saved payment method (e.g. tokenized card/UPI via
+// Razorpay). providerRef holds whatever opaque token/reference the gateway returns —
+// no card/UPI details are ever stored directly.
+model SavedPaymentMethod {
+  id          String        @id @default(uuid())
+  userId      String
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type        PaymentMethod
+  label       String // display label, e.g. "•••• 4242" or "user@upi"
+  providerRef String? // Razorpay token/reference id, if any
+  isDefault   Boolean       @default(false)
+  isActive    Boolean       @default(true)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([userId])
+}
+
+model Transaction {
+  id                String            @id @default(uuid())
+  paymentId         String
+  payment           Payment           @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  razorpayOrderId   String?           @unique
+  razorpayPaymentId String?           @unique
+  razorpaySignature String?
+  amount            Float
+  currency          String            @default("INR")
+  status            TransactionStatus @default(CREATED)
+  rawPayload        Json?
+  errorCode         String?
+  errorDescription  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([paymentId])
+  @@index([razorpayOrderId])
+  @@index([razorpayPaymentId])
+}
+
+// ─── CRM Models ───────────────────────────────────────────────────────────────
+
+model Customer {
+  id             String        @id @default(uuid())
+  name           String
+  email          String?       @unique
+  phone          String?       @unique
+  company        String?
+  address        String?
+  notes          String?
+  isActive       Boolean       @default(true)
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  contacts   Contact[]
+  leads      Lead[]
+  deals      Deal[]
+  activities Activity[]
+
+  @@index([name])
+  @@index([isActive])
+  @@index([organizationId])
+}
+
+model Contact {
+  id             String        @id @default(uuid())
+  customerId     String
+  customer       Customer      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  name           String
+  email          String?
+  phone          String?
+  position       String?
+  notes          String?
+  isPrimary      Boolean       @default(false)
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  leads      Lead[]
+  deals      Deal[]
+  activities Activity[]
+
+  @@index([customerId])
+  @@index([organizationId])
+}
+
+model Lead {
+  id             String        @id @default(uuid())
+  title          String
+  status         LeadStatus    @default(NEW)
+  value          Float?
+  source         String?
+  description    String?
+  closedAt       DateTime?
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  customerId     String?
+  customer       Customer?     @relation(fields: [customerId], references: [id])
+  contactId      String?
+  contact        Contact?      @relation(fields: [contactId], references: [id])
+  assignedToId   String?
+  assignedTo     User?         @relation("LeadAssignee", fields: [assignedToId], references: [id])
+  createdById    String
+  createdBy      User          @relation("LeadCreator", fields: [createdById], references: [id])
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  deals      Deal[]
+  activities Activity[]
+
+  @@index([status])
+  @@index([organizationId])
+  @@index([customerId])
+  @@index([assignedToId])
+  @@index([createdById])
+  @@index([createdAt])
+}
+
+model Deal {
+  id             String        @id @default(uuid())
+  title          String
+  value          Float
+  stage          DealStage     @default(PROSPECTING)
+  notes          String?
+  closedAt       DateTime?
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  customerId     String
+  customer       Customer      @relation(fields: [customerId], references: [id])
+  contactId      String?
+  contact        Contact?      @relation(fields: [contactId], references: [id])
+  leadId         String?
+  lead           Lead?         @relation(fields: [leadId], references: [id])
+  assignedToId   String?
+  assignedTo     User?         @relation("DealAssignee", fields: [assignedToId], references: [id])
+  createdById    String
+  createdBy      User          @relation("DealCreator", fields: [createdById], references: [id])
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  activities Activity[]
+
+  @@index([stage])
+  @@index([organizationId])
+  @@index([customerId])
+  @@index([leadId])
+  @@index([assignedToId])
+  @@index([createdById])
+  @@index([createdAt])
+}
+
+model Activity {
+  id             String        @id @default(uuid())
+  type           ActivityType
+  title          String
+  description    String?
+  outcome        String?
+  scheduledAt    DateTime?
+  completedAt    DateTime?
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  performedById  String
+  performedBy    User          @relation("ActivitiesPerformed", fields: [performedById], references: [id])
+  customerId     String?
+  customer       Customer?     @relation(fields: [customerId], references: [id])
+  leadId         String?
+  lead           Lead?         @relation(fields: [leadId], references: [id])
+  dealId         String?
+  deal           Deal?         @relation(fields: [dealId], references: [id])
+  contactId      String?
+  contact        Contact?      @relation(fields: [contactId], references: [id])
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([organizationId])
+  @@index([performedById])
+  @@index([customerId])
+  @@index([leadId])
+  @@index([dealId])
+  @@index([contactId])
+  @@index([createdAt])
+}
+
+// ─── Multi-Tenant Models ──────────────────────────────────────────────────────
+
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  slug      String   @unique
+  email     String?
+  phone     String?
+  address   String?
+  logoUrl   String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users          User[]             @relation("OrgUsers")
+  members        OrganizationUser[]
+  subscription   Subscription?
+  supportTickets SupportTicket[]
+  customers      Customer[]
+  leads          Lead[]
+  deals          Deal[]
+  contacts       Contact[]
+  activities     Activity[]
+  bookings       Booking[]
+  tasks          Task[]
+  attendances    Attendance[]
+
+  @@index([slug])
+  @@index([isActive])
+}
+
+model OrganizationUser {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role           Role         @default(USER)
+  isActive       Boolean      @default(true)
+  joinedAt       DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@unique([organizationId, userId])
+  @@index([organizationId])
+  @@index([userId])
+}
+
+model Plan {
+  id           String   @id @default(uuid())
+  name         String
+  tier         PlanTier @unique
+  description  String?
+  price        Float
+  maxUsers     Int
+  maxStorageGb Int
+  features     Json
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  subscriptions Subscription[]
+
+  @@index([tier])
+  @@index([isActive])
+}
+
+model Subscription {
+  id                     String             @id @default(uuid())
+  organizationId         String             @unique
+  organization           Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  planId                 String
+  plan                   Plan               @relation(fields: [planId], references: [id])
+  status                 SubscriptionStatus @default(TRIALING)
+  trialEndsAt            DateTime?
+  currentPeriodStart     DateTime
+  currentPeriodEnd       DateTime
+  cancelledAt            DateTime?
+  razorpaySubscriptionId String?            @unique
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  @@index([status])
+  @@index([planId])
+}
+
+model SystemSetting {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  value       String
+  description String?
+  updatedAt   DateTime @updatedAt
+
+  @@index([key])
+}
+
+model OtpVerification {
+  id         String    @id @default(uuid())
+  identifier String
+  otpHash    String
+  type       OtpType
+  expiresAt  DateTime
+  verifiedAt DateTime?
+  attempts   Int       @default(0)
+  createdAt  DateTime  @default(now())
+
+  @@index([identifier])
+  @@index([expiresAt])
+}
+
+// ─── Support Models ───────────────────────────────────────────────────────────
+
+model SupportTicketCounter {
+  year Int @id
+  seq  Int @default(0)
+}
+
+model SupportTicket {
+  id             String         @id @default(uuid())
+  ticketNumber   String?        @unique
+  title          String
+  subject        String?
+  description    String
+  issueType      IssueType?
+  customIssue    String?
+  status         TicketStatus   @default(OPEN)
+  priority       TicketPriority @default(MEDIUM)
+  internalNotes  String?
+  resolutionNote String?
+  resolvedAt     DateTime?
+  closedAt       DateTime?
+  organizationId String?
+  organization   Organization?  @relation(fields: [organizationId], references: [id])
+  createdById    String
+  createdBy      User           @relation("CreatedTickets", fields: [createdById], references: [id])
+  customerId     String?
+  customer       User?          @relation("CustomerSupportTickets", fields: [customerId], references: [id])
+  assignedToId   String?
+  assignedTo     User?          @relation("AssignedTickets", fields: [assignedToId], references: [id])
+  bookingId      String?
+  booking        Booking?       @relation("TicketBooking", fields: [bookingId], references: [id])
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  comments    TicketComment[]
+  attachments TicketAttachment[]
+  escalations TicketEscalation[]
+
+  @@index([organizationId])
+  @@index([createdById])
+  @@index([customerId])
+  @@index([assignedToId])
+  @@index([bookingId])
+  @@index([status])
+  @@index([priority])
+  @@index([issueType])
+  @@index([createdAt])
+  @@index([status, priority])
+}
+
+model TicketComment {
+  id         String        @id @default(uuid())
+  ticketId   String
+  ticket     SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorId   String
+  author     User          @relation("TicketComments", fields: [authorId], references: [id])
+  body       String
+  isInternal Boolean       @default(false)
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  @@index([ticketId])
+  @@index([authorId])
+}
+
+model TicketAttachment {
+  id           String        @id @default(uuid())
+  ticketId     String
+  ticket       SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  uploadedById String
+  uploadedBy   User          @relation("TicketAttachments", fields: [uploadedById], references: [id])
+  fileName     String
+  fileUrl      String
+  fileSize     Int?
+  mimeType     String?
+  createdAt    DateTime      @default(now())
+
+  @@index([ticketId])
+  @@index([uploadedById])
+}
+
+model TicketEscalation {
+  id               String         @id @default(uuid())
+  ticketId         String
+  ticket           SupportTicket  @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  escalatedById    String
+  escalatedBy      User           @relation("TicketEscalations", fields: [escalatedById], references: [id])
+  reason           String
+  previousPriority TicketPriority
+  newPriority      TicketPriority
+  createdAt        DateTime       @default(now())
+
+  @@index([ticketId])
+  @@index([escalatedById])
+}
+
+// ─── Activity Log (Timeline) ──────────────────────────────────────────────────
+
+enum ActivityAction {
+  USER_REGISTERED
+  USER_LOGIN
+  USER_LOGOUT
+  BOOKING_CREATED
+  BOOKING_UPDATED
+  BOOKING_CANCELLED
+  BOOKING_COMPLETED
+  PAYMENT_SUCCESS
+  PAYMENT_FAILED
+  WORKER_CREATED
+  WORKER_UPDATED
+  WORKER_DELETED
+  WORKER_CHECKIN
+  WORKER_CHECKOUT
+  WORKER_ASSIGNED
+  MANAGER_CREATED
+  MANAGER_UPDATED
+  MANAGER_DELETED
+  ADMIN_CREATED
+  OFFICE_CREATED
+  OFFICE_UPDATED
+  OFFICE_ACTIVATED
+  OFFICE_DEACTIVATED
+  AREA_CREATED
+  AREA_UPDATED
+  AREA_DELETED
+  AREA_ACTIVATED
+  AREA_DEACTIVATED
+  MANAGER_ACTIVATED
+  MANAGER_DEACTIVATED
+  WORKER_ACTIVATED
+  WORKER_DEACTIVATED
+  BANNER_CREATED
+  BANNER_UPDATED
+  BANNER_DELETED
+  BANNER_ACTIVATED
+  BANNER_DEACTIVATED
+  SERVICE_CREATED
+  SERVICE_UPDATED
+  PRICE_UPDATED
+  ATTENDANCE_UPDATED
+  COMPLAINT_CREATED
+  COMPLAINT_RESOLVED
+  SUPPORT_TICKET_CREATED
+  SUPPORT_TICKET_UPDATED
+  SUPPORT_TICKET_CLOSED
+  PROFILE_UPDATED
+  PASSWORD_CHANGED
+  FORGOT_PASSWORD_REQUESTED
+  RESET_OTP_VERIFIED
+  PASSWORD_RESET_SUCCESS
+  PASSWORD_RESET_FAILED
+  MOBILE_LOGIN_SUCCESS
+  MOBILE_LOGIN_FAILED
+  MOBILE_LOGIN_INACTIVE_ACCOUNT
+  SETTINGS_UPDATED
+  USER_ACTIVATED
+  USER_DEACTIVATED
+}
+
+enum ActivityModule {
+  AUTH
+  BOOKING
+  PAYMENT
+  WORKER
+  MANAGER
+  ADMIN
+  OFFICE
+  AREA
+  SERVICE
+  ATTENDANCE
+  CRM
+  SUPPORT
+  PROFILE
+  BANNER
+  SETTINGS
+  USER
+}
+
+model ActivityLog {
+  id             String         @id @default(uuid())
+  action         ActivityAction
+  module         ActivityModule
+  description    String
+  actorId        String?
+  actorName      String
+  actorRole      Role
+  targetId       String?
+  targetType     String?
+  organizationId String?
+  metadata       Json?
+  ipAddress      String?
+  device         String?
+  platform       String?
+  createdAt      DateTime       @default(now())
+
+  @@index([createdAt])
+  @@index([actorId])
+  @@index([organizationId])
+  @@index([module])
+  @@index([action])
+  @@index([actorRole])
+}
+
+// ─── Webhook Models ───────────────────────────────────────────────────────────
+
+enum WebhookProvider {
+  RAZORPAY
+}
+
+enum WebhookStatus {
+  PENDING
+  PROCESSED
+  FAILED
+  SKIPPED
+}
+
+model WebhookEvent {
+  id          String          @id @default(uuid())
+  provider    WebhookProvider
+  event       String
+  externalId  String?
+  payload     Json
+  status      WebhookStatus   @default(PENDING)
+  error       String?
+  processedAt DateTime?
+  retries     Int             @default(0)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@unique([provider, event, externalId])
+  @@index([provider, status])
+  @@index([event])
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ─── Banners ──────────────────────────────────────────────────────────────────
+
+enum BannerRedirectType {
+  NONE
+  SERVICE
+  CATEGORY
+  EXTERNAL_URL
+}
+
+model Banner {
+  id            String             @id @default(uuid())
+  title         String
+  subtitle      String?
+  imageUrl      String
+  redirectType  BannerRedirectType @default(NONE)
+  redirectValue String?
+  // Website-only (Module 3) — nullable/additive, not selected by the Mobile App's
+  // BannersService.findActive() response shape beyond an extra harmless field.
+  buttonText    String?
+  displayOrder  Int                @unique
+  isActive      Boolean            @default(true)
+  deletedAt     DateTime?
+  createdBy     String
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  @@index([isActive])
+  @@index([displayOrder])
+  @@index([deletedAt])
+}
+
+// ─── Attendance Rules (singleton) ─────────────────────────────────────────────
+
+model AttendanceRule {
+  id                             String   @id @default("singleton")
+  officeRadius                   Int      @default(200)
+  lateAfter                      String   @default("09:30")
+  halfDayAfter                   String   @default("13:00")
+  checkOutBefore                 String   @default("17:00")
+  minimumWorkingHours            Int      @default(8)
+  autoAbsentTime                 String   @default("15:00")
+  allowOutsideOffice             Boolean  @default(false)
+  requireSelfie                  Boolean  @default(true)
+  requireLiveLocation            Boolean  @default(true)
+  allowMultipleCheckIn           Boolean  @default(false)
+  enableAttendance               Boolean  @default(true)
+  weekends                       String[]
+  requireAdminAttendanceApproval Boolean  @default(false)
+  createdAt                      DateTime @default(now())
+  updatedAt                      DateTime @updatedAt
+}
+
+// ─── Website — Module 1 (Website Settings) ────────────────────────────────────
+// Public marketing website content, read via GET /website/*. Singleton models follow the
+// AttendanceRule pattern (id = "singleton"); soft delete follows the Banner pattern.
+
+model WebsiteSettings {
+  id            String    @id @default("singleton")
+  siteName      String    @default("Ziclo")
+  logoUrl       String?
+  faviconUrl    String?
+  contactEmail  String?
+  contactPhone  String?
+  address       String?
+  facebookUrl   String?
+  instagramUrl  String?
+  twitterUrl    String?
+  linkedinUrl   String?
+  youtubeUrl    String?
+  isActive      Boolean   @default(true)
+  deletedAt     DateTime?
+  createdBy     String?
+  updatedBy     String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model WebsiteHome {
+  id           String    @id @default("singleton")
+  heroTitle    String?
+  heroSubtitle String?
+  heroImageUrl String?
+  heroCtaText  String?
+  heroCtaLink  String?
+  isActive     Boolean   @default(true)
+  deletedAt    DateTime?
+  createdBy    String?
+  updatedBy    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+model WebsiteStatistic {
+  id           String    @id @default(uuid())
+  label        String
+  value        String
+  iconName     String?
+  displayOrder Int       @default(0)
+  isActive     Boolean   @default(true)
+  deletedAt    DateTime?
+  createdBy    String?
+  updatedBy    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([isActive])
+  @@index([deletedAt])
+  @@index([displayOrder])
+}
+
+model WebsiteSeo {
+  id           String    @id @default(uuid())
+  page         String    @unique
+  title        String?
+  description  String?
+  keywords     String?
+  ogImage      String?
+  canonicalUrl String?
+  isActive     Boolean   @default(true)
+  deletedAt    DateTime?
+  createdBy    String?
+  updatedBy    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([page])
+  @@index([deletedAt])
+}
+
+// ─── Website — Module 3 (Website Content) ─────────────────────────────────────
+// All read via GET /website/*. Banner is reused as-is (see buttonText above) — everything
+// below is net-new content with no Mobile App equivalent.
+
+model WebsiteGalleryItem {
+  id           String    @id @default(uuid())
+  title        String
+  description  String?
+  image        String
+  displayOrder Int       @default(0)
+  isActive     Boolean   @default(true)
+  deletedAt    DateTime?
+  createdBy    String?
+  updatedBy    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([isActive])
+  @@index([deletedAt])
+  @@index([displayOrder])
+}
+
+model WebsiteWhyZiclo {
+  id           String    @id @default(uuid())
+  icon         String?
+  title        String
+  description  String?
+  displayOrder Int       @default(0)
+  isActive     Boolean   @default(true)
+  deletedAt    DateTime?
+  createdBy    String?
+  updatedBy    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([isActive])
+  @@index([deletedAt])
+  @@index([displayOrder])
+}
+
+model WebsiteAppShowcase {
+  id           String    @id @default(uuid())
+  title        String
+  description  String?
+  image        String
+  displayOrder Int       @default(0)
+  isActive     Boolean   @default(true)
+  deletedAt    DateTime?
+  createdBy    String?
+  updatedBy    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([isActive])
+  @@index([deletedAt])
+  @@index([displayOrder])
+}
+
+model WebsiteDownloadLink {
+  id         String    @id @default("singleton")
+  androidUrl String?
+  iosUrl     String?
+  isActive   Boolean   @default(true)
+  deletedAt  DateTime?
+  createdBy  String?
+  updatedBy  String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+}
+
+model WebsiteTestimonial {
+  id           String    @id @default(uuid())
+  name         String
+  designation  String?
+  message      String
+  rating       Int       @default(5)
+  image        String?
+  displayOrder Int       @default(0)
+  isActive     Boolean   @default(true)
+  deletedAt    DateTime?
+  createdBy    String?
+  updatedBy    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([isActive])
+  @@index([deletedAt])
+  @@index([rating])
+  @@index([displayOrder])
+}
+
+model WebsiteFaq {
+  id           String    @id @default(uuid())
+  question     String
+  answer       String
+  category     String?
+  displayOrder Int       @default(0)
+  isActive     Boolean   @default(true)
+  deletedAt    DateTime?
+  createdBy    String?
+  updatedBy    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([isActive])
+  @@index([deletedAt])
+  @@index([category])
+  @@index([displayOrder])
+}
