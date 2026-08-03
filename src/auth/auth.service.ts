@@ -390,18 +390,46 @@ export class AuthService {
 
   async login(dto: LoginDto, ctx?: RequestContext) {
     const email = dto.email.toLowerCase();
-    const user = await this.prisma.user.findUnique({ where: { email } });
+    this.logger.log(`[login] Step 1: lookup user — email=${email}`);
 
-    if (!user || !(await bcrypt.compare(dto.password, user.password))) {
-      throw new UnauthorizedException('Invalid email or password');
+    let user: Awaited<ReturnType<typeof this.prisma.user.findUnique>>;
+    try {
+      user = await this.prisma.user.findUnique({ where: { email } });
+      this.logger.log(`[login] Step 1 done: user ${user ? 'found (id=' + user.id + ')' : 'not found'}`);
+    } catch (err) {
+      this.logger.error(`[login] Step 1 FAILED (prisma.user.findUnique): ${(err as Error).message}`, (err as Error).stack);
+      throw err;
     }
 
+    this.logger.log('[login] Step 2: validate password');
+    try {
+      if (!user || !(await bcrypt.compare(dto.password, user.password))) {
+        this.logger.warn('[login] Step 2 FAILED: invalid email or password');
+        throw new UnauthorizedException('Invalid email or password');
+      }
+      this.logger.log('[login] Step 2 done: password valid');
+    } catch (err) {
+      if (err instanceof UnauthorizedException) throw err;
+      this.logger.error(`[login] Step 2 FAILED (bcrypt.compare): ${(err as Error).message}`, (err as Error).stack);
+      throw err;
+    }
+
+    this.logger.log('[login] Step 3: check isActive');
     if (!user.isActive) {
+      this.logger.warn(`[login] Step 3 FAILED: account inactive — userId=${user.id}`);
       throw new UnauthorizedException('Account is inactive');
     }
+    this.logger.log('[login] Step 3 done: account active');
 
+    this.logger.log(`[login] Step 4: check emailVerified — emailVerified=${user.emailVerified}`);
     if (!user.emailVerified) {
-      await this.issueEmailVerificationOtp(email, user.name);
+      try {
+        await this.issueEmailVerificationOtp(email, user.name);
+        this.logger.log('[login] Step 4 done: verification OTP issued, blocking login (no JWT)');
+      } catch (err) {
+        this.logger.error(`[login] Step 4 FAILED (issueEmailVerificationOtp): ${(err as Error).message}`, (err as Error).stack);
+        throw err;
+      }
       return {
         success: false,
         requiresEmailVerification: true,
@@ -415,24 +443,52 @@ export class AuthService {
     //   throw new UnauthorizedException('This role must use mobile OTP to log in');
     // }
 
-    if (dto.platform === Platform.WEB && user.role === Role.MANAGER) {
-      const { start, end } = getTodayRange();
-      const active = await this.prisma.attendance.findFirst({
-        where: { userId: user.id, checkInTime: { gte: start, lt: end }, status: AttendanceStatus.CHECKED_IN },
-        select: { id: true },
-      });
-      if (!active) {
-        throw new UnauthorizedException('Please check-in from mobile app before accessing web dashboard');
+    this.logger.log(`[login] Step 5: platform/manager attendance check — platform=${dto.platform}, role=${user.role}`);
+    try {
+      if (dto.platform === Platform.WEB && user.role === Role.MANAGER) {
+        const { start, end } = getTodayRange();
+        const active = await this.prisma.attendance.findFirst({
+          where: { userId: user.id, checkInTime: { gte: start, lt: end }, status: AttendanceStatus.CHECKED_IN },
+          select: { id: true },
+        });
+        if (!active) {
+          this.logger.warn(`[login] Step 5 FAILED: manager not checked in — userId=${user.id}`);
+          throw new UnauthorizedException('Please check-in from mobile app before accessing web dashboard');
+        }
       }
+      this.logger.log('[login] Step 5 done');
+    } catch (err) {
+      if (err instanceof UnauthorizedException) throw err;
+      this.logger.error(`[login] Step 5 FAILED (prisma.attendance.findFirst): ${(err as Error).message}`, (err as Error).stack);
+      throw err;
     }
 
-    const accessToken = this.generateAccessToken(user.id, user.email);
-    const refreshToken = await this.createRefreshToken(user.id);
+    this.logger.log('[login] Step 6: generate JWT access token');
+    let accessToken: string;
+    try {
+      accessToken = this.generateAccessToken(user.id, user.email);
+      this.logger.log('[login] Step 6 done: access token generated');
+    } catch (err) {
+      this.logger.error(`[login] Step 6 FAILED (generateAccessToken): ${(err as Error).message}`, (err as Error).stack);
+      throw err;
+    }
+
+    this.logger.log('[login] Step 7: create refresh token');
+    let refreshToken: string;
+    try {
+      refreshToken = await this.createRefreshToken(user.id);
+      this.logger.log('[login] Step 7 done: refresh token created');
+    } catch (err) {
+      this.logger.error(`[login] Step 7 FAILED (createRefreshToken): ${(err as Error).message}`, (err as Error).stack);
+      throw err;
+    }
+
     const { password, ...safeUser } = user;
 
+    this.logger.log('[login] Step 8: audit + activity logging (fire-and-forget)');
     this.auditLogs
       .log({ actorId: user.id, entityType: 'Auth', entityId: user.id, action: AuditAction.LOGIN, newValue: { platform: dto.platform }, ...ctx })
-      .catch(() => {});
+      .catch((err: Error) => this.logger.error(`[login] Step 8 auditLogs FAILED: ${err.message}`));
     this.activityLog.log({
       action: ActivityAction.USER_LOGIN,
       module: ActivityModule.AUTH,
@@ -443,6 +499,7 @@ export class AuthService {
       platform: dto.platform,
     });
 
+    this.logger.log(`[login] Step 9: returning success response — userId=${user.id}`);
     return {
       success: true,
       message: 'Login successful',
@@ -753,25 +810,48 @@ export class AuthService {
   }
 
   private async issueEmailVerificationOtp(email: string, name: string): Promise<void> {
-    await this.prisma.otpVerification.deleteMany({
-      where: { identifier: email, type: OtpType.EMAIL_VERIFICATION },
-    });
+    this.logger.log(`[issueEmailVerificationOtp] Step 4a: delete previous OTP — email=${email}`);
+    try {
+      await this.prisma.otpVerification.deleteMany({
+        where: { identifier: email, type: OtpType.EMAIL_VERIFICATION },
+      });
+      this.logger.log('[issueEmailVerificationOtp] Step 4a done');
+    } catch (err) {
+      this.logger.error(`[issueEmailVerificationOtp] Step 4a FAILED (deleteMany): ${(err as Error).message}`, (err as Error).stack);
+      throw err;
+    }
 
+    this.logger.log('[issueEmailVerificationOtp] Step 4b: generate OTP');
     const otp = String(randomInt(100000, 1000000));
     const otpHash = this.hashToken(otp);
     const expiresAt = new Date(Date.now() + OTP_TTL_MS);
+    this.logger.log('[issueEmailVerificationOtp] Step 4b done: OTP generated (not logged)');
 
-    await this.prisma.otpVerification.create({
-      data: { identifier: email, otpHash, type: OtpType.EMAIL_VERIFICATION, expiresAt },
-    });
+    this.logger.log('[issueEmailVerificationOtp] Step 4c: insert OtpVerification record');
+    try {
+      await this.prisma.otpVerification.create({
+        data: { identifier: email, otpHash, type: OtpType.EMAIL_VERIFICATION, expiresAt },
+      });
+      this.logger.log('[issueEmailVerificationOtp] Step 4c done: OTP record created');
+    } catch (err) {
+      this.logger.error(`[issueEmailVerificationOtp] Step 4c FAILED (otpVerification.create): ${(err as Error).message}`, (err as Error).stack);
+      throw err;
+    }
 
+    this.logger.log(`[issueEmailVerificationOtp] Step 4d: sending OTP email via MailService — to=${email}`);
+    const startedAt = Date.now();
     try {
       await this.emailService.sendEmailVerificationOtpEmail({ to: email, name, otp });
+      this.logger.log(`[issueEmailVerificationOtp] Step 4d done: email sent in ${Date.now() - startedAt}ms`);
     } catch (err) {
-      this.logger.error(`[issueEmailVerificationOtp] Failed to send OTP to ${email}: ${(err as Error).message}`);
+      this.logger.error(
+        `[issueEmailVerificationOtp] Step 4d FAILED (SMTP send, after ${Date.now() - startedAt}ms): ${(err as Error).message}`,
+        (err as Error).stack,
+      );
       if (this.config.get<string>('NODE_ENV') !== 'production') {
         this.logger.debug(`[issueEmailVerificationOtp][DEV] OTP: ${otp}`);
       }
+      // Deliberately swallowed — login still returns requiresEmailVerification even if the email failed to send.
     }
   }
 }

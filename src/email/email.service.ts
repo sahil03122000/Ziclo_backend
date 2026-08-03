@@ -77,6 +77,10 @@ export class EmailService implements OnModuleInit {
         user: this.config.getOrThrow<string>('MAIL_USER'),
         pass: this.config.getOrThrow<string>('MAIL_PASSWORD'),
       },
+      // Bounded so a slow/unreachable SMTP host fails fast instead of hanging the request.
+      connectionTimeout: 8000,
+      greetingTimeout: 8000,
+      socketTimeout: 10000,
     });
 
     this.logger.log(`Email SMTP configured: YES (host: ${host}:${this.config.get<number>('MAIL_PORT') ?? 587})`);
@@ -191,7 +195,8 @@ export class EmailService implements OnModuleInit {
       );
     }
     const from = this.config.get<string>('MAIL_FROM') ?? this.config.get<string>('MAIL_USER');
-    this.logger.log(`Sending email verification OTP to ${opts.to}...`);
+    this.logger.log(`[sendEmailVerificationOtpEmail] Step: connecting to SMTP host and sending to ${opts.to}...`);
+    const startedAt = Date.now();
     try {
       const info = await this.transporter.sendMail({
         from: `"Ziclo" <${from}>`,
@@ -199,10 +204,15 @@ export class EmailService implements OnModuleInit {
         subject: 'Verify your Ziclo email address',
         html: this.buildEmailVerificationOtpHtml(opts),
       });
-      this.logger.log(`Email verification OTP sent to ${opts.to} (messageId=${info.messageId as string})`);
+      this.logger.log(
+        `[sendEmailVerificationOtpEmail] Step done: sent to ${opts.to} in ${Date.now() - startedAt}ms (messageId=${info.messageId as string})`,
+      );
     } catch (err) {
       const error = err as Error;
-      this.logger.error(`Failed to send email verification OTP to ${opts.to}: ${error.message}`, error.stack);
+      this.logger.error(
+        `[sendEmailVerificationOtpEmail] Step FAILED after ${Date.now() - startedAt}ms (SMTP error/timeout) for ${opts.to}: ${error.message}`,
+        error.stack,
+      );
       throw new InternalServerErrorException(`Failed to send email verification OTP: ${error.message}`);
     }
   }
