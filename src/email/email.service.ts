@@ -39,6 +39,17 @@ export interface PasswordResetOtpEmailOptions {
   otp: string;
 }
 
+export interface WelcomeEmailOptions {
+  to: string;
+  name: string;
+}
+
+export interface EmailVerificationOtpEmailOptions {
+  to: string;
+  name: string;
+  otp: string;
+}
+
 @Injectable()
 export class EmailService implements OnModuleInit {
   private readonly logger = new Logger(EmailService.name);
@@ -150,6 +161,49 @@ export class EmailService implements OnModuleInit {
       const error = err as Error;
       this.logger.error(`Failed to send password reset OTP email to ${opts.to}: ${error.message}`, error.stack);
       throw new InternalServerErrorException(`Failed to send password reset OTP email: ${error.message}`);
+    }
+  }
+
+  async sendWelcomeEmail(opts: WelcomeEmailOptions): Promise<void> {
+    if (!this.transporter) {
+      this.logger.warn('Email not configured — skipping welcome email');
+      return;
+    }
+    const from = this.config.get<string>('MAIL_FROM') ?? this.config.get<string>('MAIL_USER');
+    const supportEmail = this.config.get<string>('SUPPORT_ADMIN_EMAIL') ?? 'support@ziclo.in';
+    try {
+      await this.transporter.sendMail({
+        from: `"Ziclo" <${from}>`,
+        to: opts.to,
+        subject: 'Welcome to Ziclo – Registration Successful',
+        html: this.buildWelcomeHtml(opts, supportEmail),
+      });
+      this.logger.log(`Welcome email sent to ${opts.to}`);
+    } catch (err) {
+      this.logger.error(`Failed to send welcome email to ${opts.to}: ${(err as Error).message}`);
+    }
+  }
+
+  async sendEmailVerificationOtpEmail(opts: EmailVerificationOtpEmailOptions): Promise<void> {
+    if (!this.transporter) {
+      throw new InternalServerErrorException(
+        'Email SMTP is not configured. Set MAIL_HOST, MAIL_PORT, MAIL_USER, MAIL_PASSWORD in environment variables.',
+      );
+    }
+    const from = this.config.get<string>('MAIL_FROM') ?? this.config.get<string>('MAIL_USER');
+    this.logger.log(`Sending email verification OTP to ${opts.to}...`);
+    try {
+      const info = await this.transporter.sendMail({
+        from: `"Ziclo" <${from}>`,
+        to: opts.to,
+        subject: 'Verify your Ziclo email address',
+        html: this.buildEmailVerificationOtpHtml(opts),
+      });
+      this.logger.log(`Email verification OTP sent to ${opts.to} (messageId=${info.messageId as string})`);
+    } catch (err) {
+      const error = err as Error;
+      this.logger.error(`Failed to send email verification OTP to ${opts.to}: ${error.message}`, error.stack);
+      throw new InternalServerErrorException(`Failed to send email verification OTP: ${error.message}`);
     }
   }
 
@@ -296,6 +350,89 @@ export class EmailService implements OnModuleInit {
         </td></tr>
         <tr><td align="center" style="padding-top:24px">
           <p style="font-size:12px;color:#9ca3af;margin:0">© ${new Date().getFullYear()} Ziclo. Internal notification — do not forward.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+  }
+
+  private buildWelcomeHtml(opts: WelcomeEmailOptions, supportEmail: string): string {
+    const firstName = opts.name.split(' ')[0];
+    return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Welcome to Ziclo</title></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:40px 16px">
+    <tr><td align="center">
+      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:520px">
+        <tr><td align="center" style="padding-bottom:24px">
+          <span style="font-size:26px;font-weight:800;color:#2563eb;letter-spacing:-0.5px">Ziclo</span>
+        </td></tr>
+        <tr><td style="background:#ffffff;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.08);overflow:hidden">
+          <table width="100%" cellpadding="0" cellspacing="0"><tr><td style="background:#2563eb;height:4px"></td></tr></table>
+          <table width="100%" cellpadding="0" cellspacing="0" style="padding:36px 40px">
+            <tr><td>
+              <p style="font-size:22px;font-weight:700;color:#111827;margin:0 0 8px">Welcome to Ziclo, ${firstName}!</p>
+              <p style="font-size:15px;color:#6b7280;margin:0 0 20px">
+                Your registration was successful. We're glad to have you on board.
+              </p>
+              <p style="font-size:14px;color:#374151;margin:0 0 20px">
+                You can now log in to your Ziclo account using your registered email and password to start booking services.
+              </p>
+              <p style="font-size:13px;color:#6b7280;margin:0">
+                Need help? Reach us at <a href="mailto:${supportEmail}" style="color:#2563eb">${supportEmail}</a>.
+              </p>
+            </td></tr>
+          </table>
+        </td></tr>
+        <tr><td align="center" style="padding-top:24px">
+          <p style="font-size:12px;color:#9ca3af;margin:0">© ${new Date().getFullYear()} Ziclo. All rights reserved.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+  }
+
+  private buildEmailVerificationOtpHtml(opts: EmailVerificationOtpEmailOptions): string {
+    const firstName = opts.name.split(' ')[0];
+    return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Verify your Ziclo email</title></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:40px 16px">
+    <tr><td align="center">
+      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:520px">
+        <tr><td align="center" style="padding-bottom:24px">
+          <span style="font-size:26px;font-weight:800;color:#2563eb;letter-spacing:-0.5px">Ziclo</span>
+        </td></tr>
+        <tr><td style="background:#ffffff;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.08);overflow:hidden">
+          <table width="100%" cellpadding="0" cellspacing="0"><tr><td style="background:#2563eb;height:4px"></td></tr></table>
+          <table width="100%" cellpadding="0" cellspacing="0" style="padding:36px 40px">
+            <tr><td>
+              <p style="font-size:22px;font-weight:700;color:#111827;margin:0 0 8px">Verify your email</p>
+              <p style="font-size:15px;color:#6b7280;margin:0 0 28px">
+                Hi ${firstName}, use the OTP below to verify your Ziclo account email.
+              </p>
+              <div style="text-align:center;margin:0 0 28px">
+                <span style="display:inline-block;font-size:40px;font-weight:800;letter-spacing:12px;color:#2563eb;padding:18px 28px;background:#eff6ff;border-radius:10px">
+                  ${opts.otp}
+                </span>
+              </div>
+              <p style="font-size:13px;color:#854d0e;margin:0 0 24px;background:#fef9c3;border-radius:8px;border-left:3px solid #eab308;padding:12px 16px">
+                ⏱ This OTP expires in <strong>10 minutes</strong>.
+              </p>
+              <p style="font-size:13px;color:#6b7280;margin:0">
+                Do not share this code with anyone. If you did not request this, please ignore this email.
+              </p>
+            </td></tr>
+          </table>
+        </td></tr>
+        <tr><td align="center" style="padding-top:24px">
+          <p style="font-size:12px;color:#9ca3af;margin:0">© ${new Date().getFullYear()} Ziclo. All rights reserved.</p>
         </td></tr>
       </table>
     </td></tr>

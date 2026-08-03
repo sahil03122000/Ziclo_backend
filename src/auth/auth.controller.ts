@@ -32,8 +32,10 @@ import { LoginDto } from './dto/login.dto';
 import { LogoutDto } from './dto/logout.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
+import { ResendEmailOtpDto } from './dto/resend-email-otp.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
 import { VerifyEmailDto } from './dto/verify-email.dto';
+import { VerifyEmailOtpDto } from './dto/verify-email-otp.dto';
 
 @ApiTags('Authentication')
 @Controller('auth')
@@ -278,6 +280,33 @@ export class AuthController {
   @ApiResponse({ status: 400, description: 'Token invalid, expired, or already used' })
   verifyEmail(@Body() dto: VerifyEmailDto, @Req() req: Request) {
     return this.authService.verifyEmail(dto.token, { ipAddress: req.ip, userAgent: req.headers['user-agent'] });
+  }
+
+  @Post('verify-email-otp')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @ApiOperation({
+    summary: 'Verify email using a 6-digit OTP',
+    description:
+      'Validates the OTP sent during login (when emailVerified is false) and marks the account as verified. ' +
+      'OTP is single-use and expires in 10 minutes.',
+  })
+  @ApiOkResponse({ description: 'Email verified successfully', schema: { example: { success: true, message: 'Email verified successfully' } } })
+  @ApiResponse({ status: 400, description: 'OTP invalid, expired, or max attempts exceeded' })
+  verifyEmailOtp(@Body() dto: VerifyEmailOtpDto) {
+    return this.authService.verifyEmailOtp(dto);
+  }
+
+  @Post('resend-email-otp')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ default: { limit: 3, ttl: 60000 } })
+  @ApiOperation({
+    summary: 'Resend the email verification OTP',
+    description: 'Invalidates any existing OTP and sends a new 6-digit OTP valid for 10 minutes.',
+  })
+  @ApiOkResponse({ description: 'OTP sent', schema: { example: { success: true, message: 'OTP sent successfully' } } })
+  resendEmailOtp(@Body() dto: ResendEmailOtpDto) {
+    return this.authService.resendEmailOtp(dto);
   }
 
   @ApiBearerAuth('JWT')

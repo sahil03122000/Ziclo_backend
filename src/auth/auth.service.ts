@@ -23,7 +23,9 @@ import { LoginDto, Platform } from './dto/login.dto';
 import { LogoutDto } from './dto/logout.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
+import { ResendEmailOtpDto } from './dto/resend-email-otp.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
+import { VerifyEmailOtpDto } from './dto/verify-email-otp.dto';
 
 export interface RequestContext {
   ipAddress?: string;
@@ -373,6 +375,10 @@ export class AuthService {
       ipAddress: ctx?.ipAddress,
     });
 
+    this.emailService
+      .sendWelcomeEmail({ to: user.email, name: user.name })
+      .catch((err: Error) => this.logger.error(`[register] Welcome email failed for ${user.email}: ${err.message}`));
+
     return {
       success: true,
       message: 'User registered successfully',
@@ -392,6 +398,15 @@ export class AuthService {
 
     if (!user.isActive) {
       throw new UnauthorizedException('Account is inactive');
+    }
+
+    if (!user.emailVerified) {
+      await this.issueEmailVerificationOtp(email, user.name);
+      return {
+        success: false,
+        requiresEmailVerification: true,
+        message: 'Email verification required.',
+      };
     }
 
     // Mobile OTP enforcement is temporarily disabled — all roles may use email+password.
@@ -636,6 +651,65 @@ export class AuthService {
     return { success: true, message: 'Email verified successfully' };
   }
 
+  // ─── Email verification OTP (login gate) ──────────────────────────────────────
+
+  async verifyEmailOtp(dto: VerifyEmailOtpDto) {
+    const email = dto.email.toLowerCase();
+    const INVALID_OTP = new BadRequestException('Invalid or expired OTP');
+
+    const user = await this.prisma.user.findUnique({
+      where: { email },
+      select: { id: true, name: true, role: true, isActive: true },
+    });
+    if (!user) throw INVALID_OTP;
+
+    const otpRecord = await this.prisma.otpVerification.findFirst({
+      where: {
+        identifier: email,
+        type: OtpType.EMAIL_VERIFICATION,
+        expiresAt: { gt: new Date() },
+        verifiedAt: null,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (!otpRecord || otpRecord.attempts >= 5 || this.hashToken(dto.otp) !== otpRecord.otpHash) {
+      if (otpRecord && otpRecord.attempts < 5) {
+        await this.prisma.otpVerification.update({
+          where: { id: otpRecord.id },
+          data: { attempts: { increment: 1 } },
+        });
+      }
+      throw INVALID_OTP;
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.user.update({ where: { id: user.id }, data: { emailVerified: true } }),
+      this.prisma.otpVerification.delete({ where: { id: otpRecord.id } }),
+    ]);
+
+    this.auditLogs
+      .log({ actorId: user.id, entityType: 'User', entityId: user.id, action: AuditAction.UPDATE, newValue: { action: 'email_verified_otp' } })
+      .catch(() => {});
+
+    return { success: true, message: 'Email verified successfully' };
+  }
+
+  async resendEmailOtp(dto: ResendEmailOtpDto) {
+    const email = dto.email.toLowerCase();
+    const SAFE_RESPONSE = { success: true, message: 'OTP sent successfully' };
+
+    const user = await this.prisma.user.findUnique({
+      where: { email },
+      select: { id: true, name: true, isActive: true, emailVerified: true },
+    });
+
+    if (!user || !user.isActive || user.emailVerified) return SAFE_RESPONSE;
+
+    await this.issueEmailVerificationOtp(email, user.name);
+    return SAFE_RESPONSE;
+  }
+
   // ─── Sessions ─────────────────────────────────────────────────────────────────
 
   async getSessions(userId: string) {
@@ -676,5 +750,28 @@ export class AuthService {
 
   private hashToken(token: string): string {
     return createHash('sha256').update(token).digest('hex');
+  }
+
+  private async issueEmailVerificationOtp(email: string, name: string): Promise<void> {
+    await this.prisma.otpVerification.deleteMany({
+      where: { identifier: email, type: OtpType.EMAIL_VERIFICATION },
+    });
+
+    const otp = String(randomInt(100000, 1000000));
+    const otpHash = this.hashToken(otp);
+    const expiresAt = new Date(Date.now() + OTP_TTL_MS);
+
+    await this.prisma.otpVerification.create({
+      data: { identifier: email, otpHash, type: OtpType.EMAIL_VERIFICATION, expiresAt },
+    });
+
+    try {
+      await this.emailService.sendEmailVerificationOtpEmail({ to: email, name, otp });
+    } catch (err) {
+      this.logger.error(`[issueEmailVerificationOtp] Failed to send OTP to ${email}: ${(err as Error).message}`);
+      if (this.config.get<string>('NODE_ENV') !== 'production') {
+        this.logger.debug(`[issueEmailVerificationOtp][DEV] OTP: ${otp}`);
+      }
+    }
   }
 }

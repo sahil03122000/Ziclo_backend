@@ -175,6 +175,7 @@ enum AuditAction {
 enum OtpType {
   SMS
   EMAIL
+  EMAIL_VERIFICATION
 }
 
 enum BookingStatus {
