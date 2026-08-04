@@ -1,11 +1,6 @@
-import {
-  Injectable,
-  InternalServerErrorException,
-  Logger,
-  OnModuleInit,
-} from '@nestjs/common';
+import { Injectable, InternalServerErrorException, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import * as nodemailer from 'nodemailer';
+import { Resend } from 'resend';
 
 export interface SupportTicketCustomerEmailOptions {
   to:           string;
@@ -50,210 +45,148 @@ export interface EmailVerificationOtpEmailOptions {
   otp: string;
 }
 
+export interface BookingConfirmationEmailOptions {
+  to: string;
+  name: string;
+  bookingRef: string;
+  serviceName: string;
+  scheduledDate: string;
+  amount?: string;
+}
+
+export interface PaymentReceiptEmailOptions {
+  to: string;
+  name: string;
+  bookingRef: string;
+  paymentId: string;
+  amount: string;
+  paymentDate: string;
+}
+
 @Injectable()
 export class EmailService implements OnModuleInit {
   private readonly logger = new Logger(EmailService.name);
   private readonly isDev: boolean;
-  private transporter: nodemailer.Transporter | null = null;
+  private resend: Resend | null = null;
+  private fromAddress: string | null = null;
 
   constructor(private readonly config: ConfigService) {
     this.isDev = this.config.get<string>('NODE_ENV') !== 'production';
   }
 
   onModuleInit() {
-    const host = this.config.get<string>('MAIL_HOST');
-    if (!host) {
+    const apiKey = this.config.get<string>('RESEND_API_KEY');
+    const testMode = this.config.get<string>('TEST_EMAIL_MODE') === 'true';
+
+    // TEST_EMAIL_MODE bypasses MAIL_FROM/domain verification entirely — sends from
+    // Resend's shared sandbox address, which works without a verified custom domain.
+    const from = testMode ? 'Ziclo Test <onboarding@resend.dev>' : this.buildProdFrom();
+
+    if (!apiKey || !from) {
       this.logger.warn(
-        `Email SMTP configured: NO — ${this.isDev ? 'OTPs will be logged to console (dev mode)' : 'MAIL_HOST is required in production'}`,
+        `Resend email configured: NO — ${this.isDev ? 'OTPs will be logged to console (dev mode)' : 'RESEND_API_KEY and MAIL_FROM are required in production'}`,
       );
       return;
     }
 
-    this.transporter = nodemailer.createTransport({
-      host,
-      port: this.config.get<number>('MAIL_PORT') ?? 587,
-      secure: false, // STARTTLS on port 587
-      auth: {
-        user: this.config.getOrThrow<string>('MAIL_USER'),
-        pass: this.config.getOrThrow<string>('MAIL_PASSWORD'),
-      },
-      // Bounded so a slow/unreachable SMTP host fails fast instead of hanging the request.
-      connectionTimeout: 8000,
-      greetingTimeout: 8000,
-      socketTimeout: 10000,
-    });
+    this.resend = new Resend(apiKey);
+    this.fromAddress = from;
+    this.logger.log(`Resend email configured: YES (from: ${from}${testMode ? ' — TEST_EMAIL_MODE' : ''})`);
+  }
 
-    this.logger.log(`Email SMTP configured: YES (host: ${host}:${this.config.get<number>('MAIL_PORT') ?? 587})`);
+  private buildProdFrom(): string | null {
+    const mailFrom = this.config.get<string>('MAIL_FROM');
+    return mailFrom ? `Ziclo <${mailFrom}>` : null;
+  }
+
+  // ─── Sending (never throws — logs and returns) ─────────────────────────────────
+
+  private async send(to: string, subject: string, html: string, logLabel: string): Promise<void> {
+    if (!this.resend || !this.fromAddress) {
+      this.logger.warn(`[${logLabel}] Resend not configured — skipping email to ${to}`);
+      return;
+    }
+
+    const startedAt = Date.now();
+    try {
+      const { data, error } = await this.resend.emails.send({
+        from: this.fromAddress,
+        to,
+        subject,
+        html,
+      });
+
+      if (error) {
+        this.logger.error(`[${logLabel}] Resend API error after ${Date.now() - startedAt}ms sending to ${to}: ${error.message}`);
+        return;
+      }
+
+      this.logger.log(`[${logLabel}] Email sent to ${to} in ${Date.now() - startedAt}ms (id=${data?.id})`);
+    } catch (err) {
+      const error = err as Error;
+      this.logger.error(`[${logLabel}] Failed to send email to ${to} after ${Date.now() - startedAt}ms: ${error.message}`, error.stack);
+    }
   }
 
   async sendOtp(to: string, otp: string): Promise<void> {
-    if (!this.transporter) {
+    if (!this.resend || !this.fromAddress) {
       throw new InternalServerErrorException(
-        'Email SMTP is not configured. Set MAIL_HOST, MAIL_PORT, MAIL_USER, MAIL_PASSWORD in environment variables.',
+        'Email is not configured. Set RESEND_API_KEY and MAIL_FROM in environment variables.',
       );
     }
-
-    const from =
-      this.config.get<string>('MAIL_FROM') ?? this.config.get<string>('MAIL_USER');
-
-    this.logger.log(`Sending OTP email to ${to}...`);
-
-    try {
-      const info = await this.transporter.sendMail({
-        from: `"Ziclo" <${from}>`,
-        to,
-        subject: 'Your Login OTP',
-        html: this.buildOtpHtml(otp),
-      });
-      this.logger.log(`Email sent successfully to ${to}`);
-      this.logger.log(`Brevo Message ID: ${info.messageId}`);
-    } catch (err) {
-      const error = err as Error;
-      this.logger.error(`Failed to send OTP email to ${to}: ${error.message}`, error.stack);
+    const { error } = await this.resend.emails.send({
+      from: this.fromAddress,
+      to,
+      subject: 'Your Login OTP',
+      html: this.buildOtpHtml(otp),
+    });
+    if (error) {
+      this.logger.error(`Failed to send OTP email to ${to}: ${error.message}`);
       throw new InternalServerErrorException(`Failed to send OTP email: ${error.message}`);
     }
+    this.logger.log(`OTP email sent to ${to}`);
   }
 
   async sendPasswordResetEmail(opts: PasswordResetEmailOptions): Promise<void> {
-    if (!this.transporter) {
-      throw new InternalServerErrorException(
-        'Email SMTP is not configured. Set MAIL_HOST, MAIL_PORT, MAIL_USER, MAIL_PASSWORD in environment variables.',
-      );
-    }
-
-    const from =
-      this.config.get<string>('MAIL_FROM') ?? this.config.get<string>('MAIL_USER');
-
-    this.logger.log(`Sending password reset email to ${opts.to}...`);
-
-    try {
-      const info = await this.transporter.sendMail({
-        from: `"Ziclo" <${from}>`,
-        to: opts.to,
-        subject: 'Reset your Ziclo password',
-        html: this.buildPasswordResetHtml(opts),
-      });
-      this.logger.log(`Password reset email sent to ${opts.to} (messageId=${info.messageId as string})`);
-    } catch (err) {
-      const error = err as Error;
-      this.logger.error(`Failed to send password reset email to ${opts.to}: ${error.message}`, error.stack);
-      throw new InternalServerErrorException(`Failed to send password reset email: ${error.message}`);
-    }
+    await this.send(opts.to, 'Reset your Ziclo password', this.buildPasswordResetHtml(opts), 'sendPasswordResetEmail');
   }
 
+  /** Forgot Password OTP — logs and never throws so callers (login/register/forgot-password) never crash; the OTP row is already saved before this is called. */
   async sendPasswordResetOtpEmail(opts: PasswordResetOtpEmailOptions): Promise<void> {
-    if (!this.transporter) {
-      throw new InternalServerErrorException(
-        'Email SMTP is not configured. Set MAIL_HOST, MAIL_PORT, MAIL_USER, MAIL_PASSWORD in environment variables.',
-      );
-    }
-
-    const from =
-      this.config.get<string>('MAIL_FROM') ?? this.config.get<string>('MAIL_USER');
-
-    this.logger.log(`Sending password reset OTP email to ${opts.to}...`);
-
-    try {
-      const info = await this.transporter.sendMail({
-        from: `"Ziclo" <${from}>`,
-        to: opts.to,
-        subject: 'Your Ziclo password reset OTP',
-        html: this.buildPasswordResetOtpHtml(opts),
-      });
-      this.logger.log(`Password reset OTP email sent to ${opts.to} (messageId=${info.messageId as string})`);
-    } catch (err) {
-      const error = err as Error;
-      this.logger.error(`Failed to send password reset OTP email to ${opts.to}: ${error.message}`, error.stack);
-      throw new InternalServerErrorException(`Failed to send password reset OTP email: ${error.message}`);
+    await this.send(opts.to, 'Your Ziclo password reset OTP', this.buildPasswordResetOtpHtml(opts), 'sendPasswordResetOtpEmail');
+    if (this.isDev && !this.resend) {
+      this.logger.debug(`[sendPasswordResetOtpEmail][DEV] OTP for ${opts.to}: ${opts.otp}`);
     }
   }
 
   async sendWelcomeEmail(opts: WelcomeEmailOptions): Promise<void> {
-    if (!this.transporter) {
-      this.logger.warn('Email not configured — skipping welcome email');
-      return;
-    }
-    const from = this.config.get<string>('MAIL_FROM') ?? this.config.get<string>('MAIL_USER');
     const supportEmail = this.config.get<string>('SUPPORT_ADMIN_EMAIL') ?? 'support@ziclo.in';
-    try {
-      await this.transporter.sendMail({
-        from: `"Ziclo" <${from}>`,
-        to: opts.to,
-        subject: 'Welcome to Ziclo – Registration Successful',
-        html: this.buildWelcomeHtml(opts, supportEmail),
-      });
-      this.logger.log(`Welcome email sent to ${opts.to}`);
-    } catch (err) {
-      this.logger.error(`Failed to send welcome email to ${opts.to}: ${(err as Error).message}`);
+    await this.send(opts.to, 'Welcome to Ziclo – Registration Successful', this.buildWelcomeHtml(opts, supportEmail), 'sendWelcomeEmail');
+  }
+
+  /** Email Verification OTP (login gate) — logs and never throws; the OTP row is already saved before this is called. */
+  async sendEmailVerificationOtpEmail(opts: EmailVerificationOtpEmailOptions): Promise<void> {
+    await this.send(opts.to, 'Verify your email - Ziclo', this.buildEmailVerificationOtpHtml(opts), 'sendEmailVerificationOtpEmail');
+    if (this.isDev && !this.resend) {
+      this.logger.debug(`[sendEmailVerificationOtpEmail][DEV] OTP for ${opts.to}: ${opts.otp}`);
     }
   }
 
-  async sendEmailVerificationOtpEmail(opts: EmailVerificationOtpEmailOptions): Promise<void> {
-    if (!this.transporter) {
-      throw new InternalServerErrorException(
-        'Email SMTP is not configured. Set MAIL_HOST, MAIL_PORT, MAIL_USER, MAIL_PASSWORD in environment variables.',
-      );
-    }
-    const from = this.config.get<string>('MAIL_FROM') ?? this.config.get<string>('MAIL_USER');
-    this.logger.log(`[sendEmailVerificationOtpEmail] Step: connecting to SMTP host and sending to ${opts.to}...`);
-    const startedAt = Date.now();
-    try {
-      const info = await this.transporter.sendMail({
-        from: `"Ziclo" <${from}>`,
-        to: opts.to,
-        subject: 'Verify your Ziclo email address',
-        html: this.buildEmailVerificationOtpHtml(opts),
-      });
-      this.logger.log(
-        `[sendEmailVerificationOtpEmail] Step done: sent to ${opts.to} in ${Date.now() - startedAt}ms (messageId=${info.messageId as string})`,
-      );
-    } catch (err) {
-      const error = err as Error;
-      this.logger.error(
-        `[sendEmailVerificationOtpEmail] Step FAILED after ${Date.now() - startedAt}ms (SMTP error/timeout) for ${opts.to}: ${error.message}`,
-        error.stack,
-      );
-      throw new InternalServerErrorException(`Failed to send email verification OTP: ${error.message}`);
-    }
+  async sendBookingConfirmationEmail(opts: BookingConfirmationEmailOptions): Promise<void> {
+    await this.send(opts.to, `Booking Confirmed – ${opts.bookingRef}`, this.buildBookingConfirmationHtml(opts), 'sendBookingConfirmationEmail');
+  }
+
+  async sendPaymentReceiptEmail(opts: PaymentReceiptEmailOptions): Promise<void> {
+    await this.send(opts.to, `Payment Receipt – ${opts.bookingRef}`, this.buildPaymentReceiptHtml(opts), 'sendPaymentReceiptEmail');
   }
 
   async sendSupportTicketCreatedToCustomer(opts: SupportTicketCustomerEmailOptions): Promise<void> {
-    if (!this.transporter) {
-      this.logger.warn('Email not configured — skipping support ticket customer notification');
-      return;
-    }
-    const from = this.config.get<string>('MAIL_FROM') ?? this.config.get<string>('MAIL_USER');
-    try {
-      await this.transporter.sendMail({
-        from:    `"Ziclo Support" <${from}>`,
-        to:      opts.to,
-        subject: 'Support Ticket Created',
-        html:    this.buildSupportTicketCustomerHtml(opts),
-      });
-      this.logger.log(`Support ticket created email sent to ${opts.to} (${opts.ticketNumber})`);
-    } catch (err) {
-      this.logger.error(`Failed to send support ticket email to ${opts.to}: ${(err as Error).message}`);
-    }
+    await this.send(opts.to, 'Support Ticket Created', this.buildSupportTicketCustomerHtml(opts), 'sendSupportTicketCreatedToCustomer');
   }
 
   async sendNewSupportTicketAlertToAdmin(opts: SupportTicketAdminAlertOptions): Promise<void> {
-    if (!this.transporter) {
-      this.logger.warn('Email not configured — skipping support ticket admin alert');
-      return;
-    }
-    const from = this.config.get<string>('MAIL_FROM') ?? this.config.get<string>('MAIL_USER');
     const adminEmail = this.config.get<string>('SUPPORT_ADMIN_EMAIL') ?? 'sahil84330@gmail.com';
-    try {
-      await this.transporter.sendMail({
-        from:    `"Ziclo Support" <${from}>`,
-        to:      adminEmail,
-        subject: 'New Support Ticket Raised',
-        html:    this.buildSupportTicketAdminAlertHtml(opts),
-      });
-      this.logger.log(`Support ticket admin alert sent (${opts.ticketNumber})`);
-    } catch (err) {
-      this.logger.error(`Failed to send support ticket admin alert: ${(err as Error).message}`);
-    }
+    await this.send(adminEmail, 'New Support Ticket Raised', this.buildSupportTicketAdminAlertHtml(opts), 'sendNewSupportTicketAlertToAdmin');
   }
 
   // ─── HTML builders ────────────────────────────────────────────────────────────
@@ -411,7 +344,7 @@ export class EmailService implements OnModuleInit {
     const firstName = opts.name.split(' ')[0];
     return `<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Verify your Ziclo email</title></head>
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Verify your email - Ziclo</title></head>
 <body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif">
   <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:40px 16px">
     <tr><td align="center">
@@ -672,6 +605,106 @@ export class EmailService implements OnModuleInit {
         </table>
       </td>
     </tr>
+  </table>
+</body>
+</html>`;
+  }
+
+  private buildBookingConfirmationHtml(opts: BookingConfirmationEmailOptions): string {
+    const firstName = opts.name.split(' ')[0];
+    return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Booking Confirmed</title></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:40px 16px">
+    <tr><td align="center">
+      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:520px">
+        <tr><td align="center" style="padding-bottom:24px">
+          <span style="font-size:26px;font-weight:800;color:#2563eb;letter-spacing:-0.5px">Ziclo</span>
+        </td></tr>
+        <tr><td style="background:#ffffff;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.08);overflow:hidden">
+          <table width="100%" cellpadding="0" cellspacing="0"><tr><td style="background:#16a34a;height:4px"></td></tr></table>
+          <table width="100%" cellpadding="0" cellspacing="0" style="padding:36px 40px">
+            <tr><td>
+              <p style="font-size:22px;font-weight:700;color:#111827;margin:0 0 8px">Booking Confirmed</p>
+              <p style="font-size:15px;color:#6b7280;margin:0 0 24px">Hi ${firstName}, your booking has been confirmed.</p>
+              <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;margin:0 0 24px">
+                <tr><td style="padding:12px 16px;border-bottom:1px solid #e5e7eb;background:#f9fafb">
+                  <span style="font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px">Booking Reference</span>
+                  <p style="font-size:18px;font-weight:700;color:#2563eb;margin:4px 0 0">${opts.bookingRef}</p>
+                </td></tr>
+                <tr><td style="padding:12px 16px;border-bottom:1px solid #e5e7eb">
+                  <span style="font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px">Service</span>
+                  <p style="font-size:14px;color:#111827;margin:4px 0 0">${opts.serviceName}</p>
+                </td></tr>
+                <tr><td style="padding:12px 16px;${opts.amount ? 'border-bottom:1px solid #e5e7eb' : ''}">
+                  <span style="font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px">Scheduled Date</span>
+                  <p style="font-size:14px;color:#111827;margin:4px 0 0">${opts.scheduledDate}</p>
+                </td></tr>
+                ${opts.amount ? `<tr><td style="padding:12px 16px">
+                  <span style="font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px">Amount</span>
+                  <p style="font-size:14px;color:#111827;margin:4px 0 0">${opts.amount}</p>
+                </td></tr>` : ''}
+              </table>
+              <p style="font-size:13px;color:#6b7280;margin:0">We'll notify you once your service provider is on the way.</p>
+            </td></tr>
+          </table>
+        </td></tr>
+        <tr><td align="center" style="padding-top:24px">
+          <p style="font-size:12px;color:#9ca3af;margin:0">© ${new Date().getFullYear()} Ziclo. All rights reserved.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+  }
+
+  private buildPaymentReceiptHtml(opts: PaymentReceiptEmailOptions): string {
+    const firstName = opts.name.split(' ')[0];
+    return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Payment Receipt</title></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:40px 16px">
+    <tr><td align="center">
+      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:520px">
+        <tr><td align="center" style="padding-bottom:24px">
+          <span style="font-size:26px;font-weight:800;color:#2563eb;letter-spacing:-0.5px">Ziclo</span>
+        </td></tr>
+        <tr><td style="background:#ffffff;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.08);overflow:hidden">
+          <table width="100%" cellpadding="0" cellspacing="0"><tr><td style="background:#2563eb;height:4px"></td></tr></table>
+          <table width="100%" cellpadding="0" cellspacing="0" style="padding:36px 40px">
+            <tr><td>
+              <p style="font-size:22px;font-weight:700;color:#111827;margin:0 0 8px">Payment Receipt</p>
+              <p style="font-size:15px;color:#6b7280;margin:0 0 24px">Hi ${firstName}, thanks for your payment. Here's your receipt.</p>
+              <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;margin:0 0 24px">
+                <tr><td style="padding:12px 16px;border-bottom:1px solid #e5e7eb;background:#f9fafb">
+                  <span style="font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px">Amount Paid</span>
+                  <p style="font-size:18px;font-weight:700;color:#2563eb;margin:4px 0 0">${opts.amount}</p>
+                </td></tr>
+                <tr><td style="padding:12px 16px;border-bottom:1px solid #e5e7eb">
+                  <span style="font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px">Booking Reference</span>
+                  <p style="font-size:14px;color:#111827;margin:4px 0 0">${opts.bookingRef}</p>
+                </td></tr>
+                <tr><td style="padding:12px 16px;border-bottom:1px solid #e5e7eb">
+                  <span style="font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px">Payment ID</span>
+                  <p style="font-size:14px;color:#111827;margin:4px 0 0">${opts.paymentId}</p>
+                </td></tr>
+                <tr><td style="padding:12px 16px">
+                  <span style="font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px">Date</span>
+                  <p style="font-size:14px;color:#111827;margin:4px 0 0">${opts.paymentDate}</p>
+                </td></tr>
+              </table>
+              <p style="font-size:13px;color:#6b7280;margin:0">Keep this receipt for your records.</p>
+            </td></tr>
+          </table>
+        </td></tr>
+        <tr><td align="center" style="padding-top:24px">
+          <p style="font-size:12px;color:#9ca3af;margin:0">© ${new Date().getFullYear()} Ziclo. All rights reserved.</p>
+        </td></tr>
+      </table>
+    </td></tr>
   </table>
 </body>
 </html>`;
