@@ -187,11 +187,24 @@ export class OtpService {
 
     const otp = this.generateOtp();
     const otpHash = this.hash(otp);
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+    const createdAt = new Date();
+    const expiresAt = new Date(createdAt.getTime() + 5 * 60 * 1000);
 
-    await this.prisma.otpVerification.create({
-      data: { identifier: email, otpHash, type: OtpType.EMAIL, expiresAt },
+    // NOTE: type must be EMAIL_VERIFICATION, not EMAIL — POST /auth/verify-email-otp
+    // is handled by AuthController/AuthService.verifyEmailOtp (AuthModule is registered
+    // before OtpModule in app.module.ts, so its route wins the collision on the same
+    // path), which reads OtpVerification rows filtered by type: EMAIL_VERIFICATION.
+    // Writing type: EMAIL here meant every verify lookup found zero rows and always
+    // failed with "Invalid or expired OTP", even though the email had just been sent.
+    const created = await this.prisma.otpVerification.create({
+      data: { identifier: email, otpHash, type: OtpType.EMAIL_VERIFICATION, expiresAt },
     });
+
+    if (this.isDev) {
+      this.logger.debug(
+        `[sendEmailOtp] email=${email} otp(plain)=${otp} otpHash=${otpHash} type=${created.type} createdAt=${createdAt.toISOString()} expiresAt=${expiresAt.toISOString()} isUsed=${created.verifiedAt !== null} dbRow=${JSON.stringify(created)}`,
+      );
+    }
 
     // Always dispatch via SMTP — no dev bypass for the email OTP flow
     await this.emailService.sendOtp(email, otp);
@@ -200,7 +213,9 @@ export class OtpService {
   }
 
   async verifyEmailOtp(dto: VerifyEmailOtpDto) {
-    return this.verifyOtp({ identifier: dto.email, otp: dto.otp });
+    const email = dto.email;
+    this.logger.debug(`[verifyEmailOtp] delegating to AuthService-compatible lookup — email=${email} otpEntered=${dto.otp}`);
+    return this.verifyOtp({ identifier: email, otp: dto.otp });
   }
 
   // ─── Private ─────────────────────────────────────────────────────────────────
