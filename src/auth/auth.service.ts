@@ -712,26 +712,54 @@ export class AuthService {
 
   async verifyEmailOtp(dto: VerifyEmailOtpDto) {
     const email = dto.email.toLowerCase();
+    const otpReceived = dto.otp;
     const INVALID_OTP = new BadRequestException('Invalid or expired OTP');
+
+    this.logger.debug(`[verifyEmailOtp] email=${email} otpReceived=${otpReceived}`);
 
     const user = await this.prisma.user.findUnique({
       where: { email },
       select: { id: true, name: true, role: true, isActive: true },
     });
-    if (!user) throw INVALID_OTP;
+    if (!user) {
+      this.logger.debug(`[verifyEmailOtp] no user found for email=${email}`);
+      throw INVALID_OTP;
+    }
 
+    // Look up the OTP by email + type only (not verifiedAt/expiresAt) so the debug
+    // log below can tell us *why* it doesn't match, instead of just "not found".
     const otpRecord = await this.prisma.otpVerification.findFirst({
-      where: {
-        identifier: email,
-        type: OtpType.EMAIL_VERIFICATION,
-        expiresAt: { gt: new Date() },
-        verifiedAt: null,
-      },
+      where: { identifier: email, type: OtpType.EMAIL_VERIFICATION },
       orderBy: { createdAt: 'desc' },
     });
 
-    if (!otpRecord || otpRecord.attempts >= 5 || this.hashToken(dto.otp) !== otpRecord.otpHash) {
-      if (otpRecord && otpRecord.attempts < 5) {
+    this.logger.debug(
+      `[verifyEmailOtp] SQL query result: ${
+        otpRecord
+          ? JSON.stringify({
+              id: otpRecord.id,
+              identifier: otpRecord.identifier,
+              type: otpRecord.type,
+              otpHashStored: otpRecord.otpHash,
+              otpHashReceived: this.hashToken(otpReceived),
+              expiresAt: otpRecord.expiresAt.toISOString(),
+              now: new Date().toISOString(),
+              verifiedAt: otpRecord.verifiedAt,
+              attempts: otpRecord.attempts,
+            })
+          : 'no OtpVerification row found for this email+type'
+      }`,
+    );
+
+    const isExpired = otpRecord ? otpRecord.expiresAt <= new Date() : true;
+    const isAlreadyVerified = otpRecord ? otpRecord.verifiedAt !== null : false;
+    const hashMatches = otpRecord ? this.hashToken(otpReceived) === otpRecord.otpHash : false;
+
+    if (!otpRecord || isExpired || isAlreadyVerified || otpRecord.attempts >= 5 || !hashMatches) {
+      this.logger.debug(
+        `[verifyEmailOtp] rejecting — found=${!!otpRecord} expired=${isExpired} alreadyVerified=${isAlreadyVerified} attemptsExceeded=${otpRecord ? otpRecord.attempts >= 5 : 'n/a'} hashMatches=${hashMatches}`,
+      );
+      if (otpRecord && !isExpired && !isAlreadyVerified && otpRecord.attempts < 5) {
         await this.prisma.otpVerification.update({
           where: { id: otpRecord.id },
           data: { attempts: { increment: 1 } },
@@ -740,10 +768,16 @@ export class AuthService {
       throw INVALID_OTP;
     }
 
+    // Mark verified then delete — verified=true is set first so the row would show as
+    // consumed even if the delete somehow failed, then it's removed per requirement 7.
+    const verifiedAt = new Date();
     await this.prisma.$transaction([
       this.prisma.user.update({ where: { id: user.id }, data: { emailVerified: true } }),
+      this.prisma.otpVerification.update({ where: { id: otpRecord.id }, data: { verifiedAt } }),
       this.prisma.otpVerification.delete({ where: { id: otpRecord.id } }),
     ]);
+
+    this.logger.debug(`[verifyEmailOtp] success — userId=${user.id} emailVerified=true verifiedAt=${verifiedAt.toISOString()}, OTP deleted`);
 
     this.auditLogs
       .log({ actorId: user.id, entityType: 'User', entityId: user.id, action: AuditAction.UPDATE, newValue: { action: 'email_verified_otp' } })
@@ -809,6 +843,11 @@ export class AuthService {
     return createHash('sha256').update(token).digest('hex');
   }
 
+  /** Gates plaintext-OTP debug logging to non-production so it's never logged in prod. */
+  private isDebugEmailOtp(): boolean {
+    return this.config.get<string>('NODE_ENV') !== 'production';
+  }
+
   private async issueEmailVerificationOtp(email: string, name: string): Promise<void> {
     this.logger.log(`[issueEmailVerificationOtp] Step 4a: delete previous OTP — email=${email}`);
     try {
@@ -826,13 +865,16 @@ export class AuthService {
     const otpHash = this.hashToken(otp);
     const expiresAt = new Date(Date.now() + OTP_TTL_MS);
     this.logger.log('[issueEmailVerificationOtp] Step 4b done: OTP generated (not logged)');
+    if (this.isDebugEmailOtp()) {
+      this.logger.debug(`[issueEmailVerificationOtp] email=${email} otpStored(plain)=${otp} otpHashStored=${otpHash} type=${OtpType.EMAIL_VERIFICATION} expiresAt=${expiresAt.toISOString()}`);
+    }
 
     this.logger.log('[issueEmailVerificationOtp] Step 4c: insert OtpVerification record');
     try {
-      await this.prisma.otpVerification.create({
+      const created = await this.prisma.otpVerification.create({
         data: { identifier: email, otpHash, type: OtpType.EMAIL_VERIFICATION, expiresAt },
       });
-      this.logger.log('[issueEmailVerificationOtp] Step 4c done: OTP record created');
+      this.logger.log(`[issueEmailVerificationOtp] Step 4c done: OTP record created (id=${created.id})`);
     } catch (err) {
       this.logger.error(`[issueEmailVerificationOtp] Step 4c FAILED (otpVerification.create): ${(err as Error).message}`, (err as Error).stack);
       throw err;
