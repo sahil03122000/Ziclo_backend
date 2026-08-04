@@ -82,6 +82,19 @@ class EnvironmentVariables {
   @IsString()
   S3_SIGNED_URL_TTL: string;
 
+  // ── Cloudinary (image/icon uploads) ─────────────────────────────────────────────
+  @IsOptional()
+  @IsString()
+  CLOUDINARY_CLOUD_NAME: string;
+
+  @IsOptional()
+  @IsString()
+  CLOUDINARY_API_KEY: string;
+
+  @IsOptional()
+  @IsString()
+  CLOUDINARY_API_SECRET: string;
+
   // ── Brevo (email API) ──────────────────────────────────────────────────────────
   // Omit to fall back to console logging in dev mode.
   @IsOptional()

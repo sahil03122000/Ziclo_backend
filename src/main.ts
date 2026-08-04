@@ -1,3 +1,7 @@
+// Must run before AppModule (and anything it imports, e.g. the Cloudinary config) is
+// loaded, so process.env is populated from .env in local dev before those modules read it.
+import 'dotenv/config';
+
 import { join } from 'path';
 
 import { BadRequestException, ValidationPipe } from '@nestjs/common';
