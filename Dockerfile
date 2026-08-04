@@ -23,6 +23,14 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY prisma ./prisma
 
+# uploads/images, uploads/icons, and exports are written to at runtime by the
+# non-root "nestjs" user (multer diskStorage, report generation). Without this,
+# /app is root-owned (default COPY ownership) and mkdirSync() in those request
+# handlers fails with EACCES, crashing the request — e.g. POST /uploads/image
+# returning a 502 in production even though the route itself exists.
+RUN mkdir -p /app/uploads/images /app/uploads/icons /app/exports \
+  && chown -R nestjs:nodejs /app/uploads /app/exports
+
 USER nestjs
 
 EXPOSE 8080

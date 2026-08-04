@@ -80,11 +80,13 @@ export class ImageUploadController {
       throw new InternalServerErrorException('BASE_URL is not configured. Set BASE_URL=http://<server-ip>:3000 in .env');
     }
 
-    const url = `${baseUrl}/uploads/images/${file.filename}`;
+    const path = `/uploads/images/${file.filename}`;
+    const url = `${baseUrl}${path}`;
     return {
       success: true,
-      message: 'Image uploaded successfully',
-      data: { url, fileName: file.filename },
+      url,
+      filename: file.filename,
+      path,
     };
   }
 
