@@ -771,7 +771,7 @@ export class AuthService {
     // Mark verified then delete — verified=true is set first so the row would show as
     // consumed even if the delete somehow failed, then it's removed per requirement 7.
     const verifiedAt = new Date();
-    await this.prisma.$transaction([
+    const [updatedUser] = await this.prisma.$transaction([
       this.prisma.user.update({ where: { id: user.id }, data: { emailVerified: true } }),
       this.prisma.otpVerification.update({ where: { id: otpRecord.id }, data: { verifiedAt } }),
       this.prisma.otpVerification.delete({ where: { id: otpRecord.id } }),
@@ -779,11 +779,24 @@ export class AuthService {
 
     this.logger.debug(`[verifyEmailOtp] success — userId=${user.id} emailVerified=true verifiedAt=${verifiedAt.toISOString()}, OTP deleted`);
 
+    // Issue a full session here, same shape as login()/register() — callers (e.g. the
+    // mobile app's OTP/verify-email screens) destructure `data.user`/`data.accessToken`/
+    // `data.refreshToken` straight off this response with no fallback. Previously this
+    // endpoint returned only { success, message }, so `data` was undefined and that
+    // destructure threw "Cannot read property 'user' of undefined" on the client.
+    const accessToken = this.generateAccessToken(updatedUser.id, updatedUser.email);
+    const refreshToken = await this.createRefreshToken(updatedUser.id);
+    const { password, ...safeUser } = updatedUser;
+
     this.auditLogs
       .log({ actorId: user.id, entityType: 'User', entityId: user.id, action: AuditAction.UPDATE, newValue: { action: 'email_verified_otp' } })
       .catch(() => {});
 
-    return { success: true, message: 'Email verified successfully' };
+    return {
+      success: true,
+      message: 'Email verified successfully',
+      data: { user: safeUser, accessToken, refreshToken },
+    };
   }
 
   async resendEmailOtp(dto: ResendEmailOtpDto) {
