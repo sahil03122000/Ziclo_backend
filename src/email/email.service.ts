@@ -1,6 +1,8 @@
 import { Injectable, InternalServerErrorException, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Resend } from 'resend';
+
+const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email';
+const RETRY_DELAY_MS = 2000;
 
 export interface SupportTicketCustomerEmailOptions {
   to:           string;
@@ -67,82 +69,105 @@ export interface PaymentReceiptEmailOptions {
 export class EmailService implements OnModuleInit {
   private readonly logger = new Logger(EmailService.name);
   private readonly isDev: boolean;
-  private resend: Resend | null = null;
-  private fromAddress: string | null = null;
+  private apiKey: string | null = null;
+  private senderName: string | null = null;
+  private senderEmail: string | null = null;
 
   constructor(private readonly config: ConfigService) {
     this.isDev = this.config.get<string>('NODE_ENV') !== 'production';
   }
 
   onModuleInit() {
-    const apiKey = this.config.get<string>('RESEND_API_KEY');
-    const testMode = this.config.get<string>('TEST_EMAIL_MODE') === 'true';
+    const apiKey = this.config.get<string>('BREVO_API_KEY');
+    const senderName = this.config.get<string>('BREVO_SENDER_NAME');
+    const senderEmail = this.config.get<string>('BREVO_SENDER_EMAIL');
 
-    // TEST_EMAIL_MODE bypasses MAIL_FROM/domain verification entirely — sends from
-    // Resend's shared sandbox address, which works without a verified custom domain.
-    const from = testMode ? 'Ziclo Test <onboarding@resend.dev>' : this.buildProdFrom();
-
-    if (!apiKey || !from) {
+    if (!apiKey || !senderName || !senderEmail) {
       this.logger.warn(
-        `Resend email configured: NO — ${this.isDev ? 'OTPs will be logged to console (dev mode)' : 'RESEND_API_KEY and MAIL_FROM are required in production'}`,
+        `Brevo email configured: NO — ${this.isDev ? 'OTPs will be logged to console (dev mode)' : 'BREVO_API_KEY, BREVO_SENDER_NAME and BREVO_SENDER_EMAIL are required in production'}`,
       );
       return;
     }
 
-    this.resend = new Resend(apiKey);
-    this.fromAddress = from;
-    this.logger.log(`Resend email configured: YES (from: ${from}${testMode ? ' — TEST_EMAIL_MODE' : ''})`);
-  }
-
-  private buildProdFrom(): string | null {
-    const mailFrom = this.config.get<string>('MAIL_FROM');
-    return mailFrom ? `Ziclo <${mailFrom}>` : null;
+    this.apiKey = apiKey;
+    this.senderName = senderName;
+    this.senderEmail = senderEmail;
+    this.logger.log(`Brevo email configured: YES (sender: ${senderName} <${senderEmail}>)`);
   }
 
   // ─── Sending (never throws — logs and returns) ─────────────────────────────────
 
+  /** Calls the Brevo Transactional Email API, retrying once after 2s on failure. */
+  private async callBrevoApi(to: string, subject: string, html: string): Promise<{ ok: true; messageId?: string } | { ok: false; error: string }> {
+    const body = JSON.stringify({
+      sender: { name: this.senderName, email: this.senderEmail },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+    });
+
+    const attempt = async (): Promise<{ ok: true; messageId?: string } | { ok: false; error: string }> => {
+      const res = await fetch(BREVO_API_URL, {
+        method: 'POST',
+        headers: {
+          'api-key': this.apiKey as string,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body,
+      });
+
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => '');
+        return { ok: false, error: `HTTP ${res.status}: ${errBody}` };
+      }
+
+      const json = (await res.json().catch(() => ({}))) as { messageId?: string };
+      return { ok: true, messageId: json.messageId };
+    };
+
+    try {
+      const first = await attempt();
+      if (first.ok) return first;
+
+      this.logger.warn(`Brevo send to ${to} failed (${first.error}) — retrying once in ${RETRY_DELAY_MS}ms`);
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+
+      const second = await attempt();
+      return second;
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
   private async send(to: string, subject: string, html: string, logLabel: string): Promise<void> {
-    if (!this.resend || !this.fromAddress) {
-      this.logger.warn(`[${logLabel}] Resend not configured — skipping email to ${to}`);
+    if (!this.apiKey || !this.senderEmail) {
+      this.logger.warn(`[${logLabel}] Brevo not configured — skipping email to ${to}`);
       return;
     }
 
     const startedAt = Date.now();
-    try {
-      const { data, error } = await this.resend.emails.send({
-        from: this.fromAddress,
-        to,
-        subject,
-        html,
-      });
+    const result = await this.callBrevoApi(to, subject, html);
 
-      if (error) {
-        this.logger.error(`[${logLabel}] Resend API error after ${Date.now() - startedAt}ms sending to ${to}: ${error.message}`);
-        return;
-      }
-
-      this.logger.log(`[${logLabel}] Email sent to ${to} in ${Date.now() - startedAt}ms (id=${data?.id})`);
-    } catch (err) {
-      const error = err as Error;
-      this.logger.error(`[${logLabel}] Failed to send email to ${to} after ${Date.now() - startedAt}ms: ${error.message}`, error.stack);
+    if (!result.ok) {
+      this.logger.error(`[${logLabel}] Failed to send email to ${to} after ${Date.now() - startedAt}ms: ${result.error}`);
+      return;
     }
+
+    this.logger.log(`[${logLabel}] Email sent to ${to} in ${Date.now() - startedAt}ms (messageId=${result.messageId})`);
   }
 
   async sendOtp(to: string, otp: string): Promise<void> {
-    if (!this.resend || !this.fromAddress) {
+    if (!this.apiKey || !this.senderEmail) {
       throw new InternalServerErrorException(
-        'Email is not configured. Set RESEND_API_KEY and MAIL_FROM in environment variables.',
+        'Email is not configured. Set BREVO_API_KEY, BREVO_SENDER_NAME and BREVO_SENDER_EMAIL in environment variables.',
       );
     }
-    const { error } = await this.resend.emails.send({
-      from: this.fromAddress,
-      to,
-      subject: 'Your Login OTP',
-      html: this.buildOtpHtml(otp),
-    });
-    if (error) {
-      this.logger.error(`Failed to send OTP email to ${to}: ${error.message}`);
-      throw new InternalServerErrorException(`Failed to send OTP email: ${error.message}`);
+
+    const result = await this.callBrevoApi(to, 'Your Login OTP', this.buildOtpHtml(otp));
+    if (!result.ok) {
+      this.logger.error(`Failed to send OTP email to ${to}: ${result.error}`);
+      throw new InternalServerErrorException(`Failed to send OTP email: ${result.error}`);
     }
     this.logger.log(`OTP email sent to ${to}`);
   }
@@ -154,7 +179,7 @@ export class EmailService implements OnModuleInit {
   /** Forgot Password OTP — logs and never throws so callers (login/register/forgot-password) never crash; the OTP row is already saved before this is called. */
   async sendPasswordResetOtpEmail(opts: PasswordResetOtpEmailOptions): Promise<void> {
     await this.send(opts.to, 'Your Ziclo password reset OTP', this.buildPasswordResetOtpHtml(opts), 'sendPasswordResetOtpEmail');
-    if (this.isDev && !this.resend) {
+    if (this.isDev && !this.apiKey) {
       this.logger.debug(`[sendPasswordResetOtpEmail][DEV] OTP for ${opts.to}: ${opts.otp}`);
     }
   }
@@ -167,7 +192,7 @@ export class EmailService implements OnModuleInit {
   /** Email Verification OTP (login gate) — logs and never throws; the OTP row is already saved before this is called. */
   async sendEmailVerificationOtpEmail(opts: EmailVerificationOtpEmailOptions): Promise<void> {
     await this.send(opts.to, 'Verify your email - Ziclo', this.buildEmailVerificationOtpHtml(opts), 'sendEmailVerificationOtpEmail');
-    if (this.isDev && !this.resend) {
+    if (this.isDev && !this.apiKey) {
       this.logger.debug(`[sendEmailVerificationOtpEmail][DEV] OTP for ${opts.to}: ${opts.otp}`);
     }
   }

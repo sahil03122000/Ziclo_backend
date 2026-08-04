@@ -82,21 +82,19 @@ class EnvironmentVariables {
   @IsString()
   S3_SIGNED_URL_TTL: string;
 
-  // ── Resend (email) ─────────────────────────────────────────────────────────────
+  // ── Brevo (email API) ──────────────────────────────────────────────────────────
   // Omit to fall back to console logging in dev mode.
   @IsOptional()
   @IsString()
-  RESEND_API_KEY: string;
+  BREVO_API_KEY: string;
 
   @IsOptional()
   @IsString()
-  MAIL_FROM: string;
+  BREVO_SENDER_NAME: string;
 
-  // TEST_EMAIL_MODE=true sends from Resend's onboarding@resend.dev sandbox address,
-  // bypassing MAIL_FROM/custom-domain verification. Testing only — never set in production.
   @IsOptional()
   @IsString()
-  TEST_EMAIL_MODE: string;
+  BREVO_SENDER_EMAIL: string;
 }
 
 export function validate(config: Record<string, unknown>) {
