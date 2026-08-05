@@ -6,6 +6,12 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { CreateTimeSlotDto } from './dto/create-time-slot.dto';
 import { TimeSlotQueryDto } from './dto/time-slot-query.dto';
 
+// Default working hours used to auto-generate a day's slots the first time
+// they're requested for a service/date that has none yet — see findAll().
+const DEFAULT_WORKING_HOURS_START = 9; // 09:00
+const DEFAULT_WORKING_HOURS_END = 18; // 18:00 (last slot starts at 17:00)
+const DEFAULT_SLOT_DURATION_MINUTES = 60;
+
 const SLOT_SELECT = {
   id: true,
   date: true,
@@ -75,6 +81,19 @@ export class TimeSlotsService {
       if (dateTo) (where.date as Prisma.DateTimeFilter).lte = dateTo;
     }
 
+    // A specific service + specific date is the "what times can I book?" query (the one the
+    // customer-facing flow calls). If nothing has ever been generated for that day yet — the
+    // normal state for a brand-new service/date, since slots are otherwise only created one at
+    // a time via POST — generate the default working-hours slots for it now instead of
+    // returning an empty list. Once generated they're real persisted rows, so booking against
+    // their id works exactly like any admin-created slot.
+    if (serviceId && date && isAvailable === undefined) {
+      const existingCount = await this.prisma.timeSlot.count({ where: { serviceId, date } });
+      if (existingCount === 0) {
+        await this.generateDefaultSlotsForDay(serviceId, date);
+      }
+    }
+
     const [slots, total] = await this.prisma.$transaction([
       this.prisma.timeSlot.findMany({
         where,
@@ -90,6 +109,30 @@ export class TimeSlotsService {
       success: true,
       data: { slots, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } },
     };
+  }
+
+  /**
+   * Creates one TimeSlot row per hour of the default working day (09:00-18:00) for a
+   * service/date that has none yet. Only called when the service actually exists and is
+   * active; a bogus serviceId still correctly returns an empty list rather than creating
+   * orphaned slots. Uses skipDuplicates so a concurrent request generating the same day
+   * can't violate the [serviceId, date, startTime] unique constraint.
+   */
+  private async generateDefaultSlotsForDay(serviceId: string, date: Date): Promise<void> {
+    const service = await this.prisma.service.findUnique({
+      where: { id: serviceId },
+      select: { id: true, isActive: true },
+    });
+    if (!service || !service.isActive) return;
+
+    const slots: Prisma.TimeSlotCreateManyInput[] = [];
+    for (let hour = DEFAULT_WORKING_HOURS_START; hour < DEFAULT_WORKING_HOURS_END; hour += DEFAULT_SLOT_DURATION_MINUTES / 60) {
+      const startTime = `${String(hour).padStart(2, '0')}:00`;
+      const endTime = `${String(hour + DEFAULT_SLOT_DURATION_MINUTES / 60).padStart(2, '0')}:00`;
+      slots.push({ serviceId, date, startTime, endTime, capacity: 1 });
+    }
+
+    await this.prisma.timeSlot.createMany({ data: slots, skipDuplicates: true });
   }
 
   async findOne(id: string) {
