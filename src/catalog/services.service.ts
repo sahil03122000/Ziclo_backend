@@ -418,6 +418,17 @@ export class CatalogServicesService {
       }
 
       return updated;
+    }, {
+      // This transaction does one sequential DB round trip per property type / package /
+      // pricing option in the payload (findUnique + update-or-create, plus deleteManys for
+      // removed rows) — Prisma's default 5s interactive-transaction timeout is easily
+      // exceeded for services with several property types, each is fine on its own, but
+      // over Neon's pooled connection the cumulative latency adds up. Once the timeout hits,
+      // Prisma closes the transaction server-side and the next query against `tx` (often
+      // the `tx.package.deleteMany` near the end) throws P2028 "Transaction not found".
+      // Raising timeout/maxWait here — the transaction's logic is unchanged — fixes that.
+      timeout: 30000,
+      maxWait: 10000,
     });
 
     this.audit(actorId, id, AuditAction.UPDATE, { ...updateData, propertyTypesSubmitted: dto.propertyTypes?.length ?? 0 });
