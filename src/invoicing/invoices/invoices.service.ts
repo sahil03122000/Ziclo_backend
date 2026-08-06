@@ -181,7 +181,12 @@ export class InvoicesService {
     });
     if (!booking) throw new NotFoundException('Booking not found');
 
-    const gstRate = 18;
+    // booking.totalAmount/advanceAmount are already GST-inclusive (BookingsService.create()
+    // computes them the same way previewPrice() does — service price + tax, rounded to the
+    // rupee), so this invoice must NOT apply GST again on top of them — that would silently
+    // charge the customer tax-on-tax and desync the Razorpay order amount from what was
+    // previewed/quoted. gstRate: 0 here means computeTaxes just carries the amount through.
+    const gstRate = 0;
     const amount = paymentType === PaymentType.FULL
       ? booking.totalAmount ?? 0
       : booking.advanceAmount ?? booking.totalAmount ?? 0;

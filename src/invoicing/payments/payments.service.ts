@@ -18,6 +18,9 @@ const PAYMENT_INCLUDE: Prisma.PaymentInclude = {
 };
 
 const r2 = (n: number) => parseFloat(n.toFixed(2));
+// Booking/payment amounts are whole rupees, not paise-precision decimals — r2 stays
+// 2-decimal for GST line-item math elsewhere, this is only for amounts actually charged/stored.
+const r0 = (n: number) => Math.round(n);
 
 @Injectable()
 export class PaymentsService {
@@ -116,12 +119,16 @@ export class PaymentsService {
 
   async createRazorpayOrder(dto: CreateRazorpayOrderDto, actorId: string, orgId?: string) {
     const invoice = await this.assertPayableInvoice(dto.invoiceId, orgId);
-    const outstanding = r2(invoice.total - invoice.paidAmount);
+    // Whole rupees, not paise-precision decimals — the invoice total can carry fractional
+    // cents from GST math (e.g. 399 + 18% = 470.82); round to the nearest rupee before this
+    // becomes the amount actually charged via Razorpay, so the order is never created for a
+    // fractional amount like ₹470.82.
+    const outstanding = r0(invoice.total - invoice.paidAmount);
 
     if (outstanding <= 0) throw new BadRequestException('Invoice is already fully paid');
 
     const paymentType = dto.paymentType ?? PaymentType.FULL;
-    const amountInPaise = Math.round(outstanding * 100);
+    const amountInPaise = outstanding * 100;
     const order = await this.razorpay.createOrder(amountInPaise, invoice.invoiceNumber);
 
     const payment = await this.prisma.payment.create({
@@ -228,11 +235,15 @@ export class PaymentsService {
       throw new BadRequestException('Payment signature verification failed. The payment could not be confirmed.');
     }
 
+    // FULL: payable = total, remaining = 0.
+    // ADVANCE: payable = rounded advance amount, remaining = total - payable (derived from
+    // the already-rounded payable, never independently rounded, so payable + remaining is
+    // always exactly totalAmount — no penny/rupee drift between the two).
     const paymentType = payment.paymentType ?? PaymentType.FULL;
-    const totalAmount = payment.invoice.booking?.totalAmount ?? payment.amount;
-    const advanceAmount = payment.invoice.booking?.advanceAmount ?? totalAmount;
+    const totalAmount = r0(payment.invoice.booking?.totalAmount ?? payment.amount);
+    const advanceAmount = r0(payment.invoice.booking?.advanceAmount ?? totalAmount);
     const paidAmount = paymentType === PaymentType.ADVANCE ? advanceAmount : totalAmount;
-    const remainingAmount = paymentType === PaymentType.ADVANCE ? r2(totalAmount - advanceAmount) : 0;
+    const remainingAmount = paymentType === PaymentType.ADVANCE ? totalAmount - paidAmount : 0;
 
     await this.prisma.$transaction([
       this.prisma.transaction.update({

@@ -107,6 +107,12 @@ const TERMINAL_STATUSES: BookingStatus[] = [
 
 const r2 = (n: number) => parseFloat(n.toFixed(2));
 
+// Booking/payment amounts (totalAmount, advanceAmount, remainingAmount, and the amount
+// actually charged via Razorpay) are stored and charged in whole rupees, not paise-precision
+// decimals — r2 stays 2-decimal for GST-line-item math elsewhere, this is only for the
+// customer-facing booking amount fields.
+const r0 = (n: number) => Math.round(n);
+
 // ─── Worker job response shaping ───────────────────────────────────────────────
 // Maps a Booking (BOOKING_INCLUDE shape) onto the flat "job" contract the Worker Panel
 // screens (Jobs / Job Details / Start Work / Before-After Image / Payment / Complete Task)
@@ -272,7 +278,18 @@ export class BookingsService {
     }
 
     const bookingRef = await this.runQuery('booking ref generation (booking.count)', () => this.generateRef());
-    const totalAmount = pricingOption.price;
+    // Same GST-inclusive total previewPrice() shows the customer before they book (servicePrice
+    // + tax, rounded to the nearest rupee) — booking.totalAmount must match what was previewed,
+    // otherwise the amount charged later drifts from what the customer was quoted.
+    const { taxPercentage, advancePaymentPercentage } = await this.getOrgPaymentSettings();
+    const servicePrice = pricingOption.price;
+    const gst = r2((servicePrice * taxPercentage) / 100);
+    const totalAmount = r0(servicePrice + gst);
+    // Root cause of "advance payment charges the full amount": this used to be
+    // `advanceAmount: totalAmount` — i.e. the "advance" was always the full total,
+    // so the Razorpay order created later off booking.advanceAmount was never actually
+    // reduced for ADVANCE payments. Compute it from the org's configured percentage instead.
+    const advanceAmount = r0((totalAmount * advancePaymentPercentage) / 100);
 
     const booking = await this.runQuery('create booking (booking.create)', () =>
       this.prisma.booking.create({
@@ -289,7 +306,7 @@ export class BookingsService {
           organizationId: orgId ?? null,
           addressId:      dto.addressId,
           totalAmount,
-          advanceAmount:  totalAmount,
+          advanceAmount,
           packagePrice:   pkg.price,
           bookingRef,
           status:         BookingStatus.PENDING_PAYMENT,
@@ -874,9 +891,12 @@ export class BookingsService {
     const { taxPercentage, advancePaymentPercentage } = await this.getOrgPaymentSettings();
 
     const gst = r2((servicePrice * taxPercentage) / 100);
-    const total = r2(servicePrice + gst);
-    const advance = r2((total * advancePaymentPercentage) / 100);
-    const remaining = r2(total - advance);
+    // total/advance/remaining are whole-rupee amounts (what's actually stored on the
+    // booking and charged via Razorpay) — remaining is derived from the rounded total
+    // and advance, not independently rounded, so advance + remaining always equals total.
+    const total = r0(servicePrice + gst);
+    const advance = r0((total * advancePaymentPercentage) / 100);
+    const remaining = total - advance;
 
     return { success: true, data: { servicePrice, gst, total, advance, remaining } };
   }
@@ -906,9 +926,9 @@ export class BookingsService {
       };
     }
 
-    const advancePayment = r2(booking.advanceAmount ?? booking.totalAmount ?? 0);
+    const advancePayment = r0(booking.advanceAmount ?? booking.totalAmount ?? 0);
     const tax = r2((advancePayment * 18) / 100);
-    const total = r2(advancePayment + tax);
+    const total = r0(advancePayment + tax);
     return { success: true, data: { tax, advancePayment, total, remaining: total } };
   }
 
