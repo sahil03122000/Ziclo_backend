@@ -28,10 +28,21 @@ export class RazorpayService {
     this.keySecret = config.get<string>('RAZORPAY_KEY_SECRET') ?? '';
     this.mode      = this.keyId.startsWith('rzp_test_') ? 'test' : 'live';
 
+    // Fail fast at application startup, not at request time. Previously a missing
+    // key only produced a warning here, so the app would boot "successfully" and
+    // every payment request would then fail at createOrder()/verifyPaymentSignature()
+    // with a 503 — surprising the client deep into the booking flow instead of
+    // surfacing the misconfiguration immediately, loudly, and to the deployer.
     if (this.keyId && this.keySecret) {
-      this.logger.log(`Razorpay initialized — mode: ${this.mode.toUpperCase()}, keyId: ${this.keyId}`);
+      // Never log the secret — only the key id, and only its prefix/mode, not the full value.
+      const maskedKeyId = this.keyId.length > 8 ? `${this.keyId.slice(0, 8)}…${this.keyId.slice(-4)}` : this.keyId;
+      this.logger.log(`✓ Razorpay configured — mode: ${this.mode.toUpperCase()}, keyId: ${maskedKeyId}`);
     } else {
-      this.logger.warn('Razorpay not configured — RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET missing');
+      this.logger.error('✗ Razorpay NOT configured — RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET missing');
+      throw new Error(
+        'Razorpay payment gateway is not configured. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET ' +
+          'in the environment before starting the app — refusing to boot with a broken payment gateway.',
+      );
     }
   }
 

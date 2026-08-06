@@ -95,6 +95,23 @@ class EnvironmentVariables {
   @IsString()
   CLOUDINARY_API_SECRET: string;
 
+  // ── Razorpay (payments) ────────────────────────────────────────────────────────
+  // Required for the payment gateway to function — RazorpayService fails fast at
+  // application startup (not at request time) if either is missing. Optional here
+  // at the schema level so unrelated dev work (auth, uploads, etc.) isn't blocked
+  // by class-validator before RazorpayService gets a chance to give a clear error.
+  @IsOptional()
+  @IsString()
+  RAZORPAY_KEY_ID: string;
+
+  @IsOptional()
+  @IsString()
+  RAZORPAY_KEY_SECRET: string;
+
+  @IsOptional()
+  @IsString()
+  RAZORPAY_WEBHOOK_SECRET: string;
+
   // ── Brevo (email API) ──────────────────────────────────────────────────────────
   // Omit to fall back to console logging in dev mode.
   @IsOptional()
