@@ -2,6 +2,8 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  InternalServerErrorException,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { AuditAction, BookingStatus, InvoiceStatus, PaymentMethod, PaymentStatus, PaymentType, Prisma } from '@prisma/client';
@@ -45,6 +47,8 @@ const MUTABLE_STATUSES: InvoiceStatus[] = [InvoiceStatus.DRAFT, InvoiceStatus.SE
 
 @Injectable()
 export class InvoicesService {
+  private readonly logger = new Logger(InvoicesService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly notifications: NotificationsService,
@@ -590,11 +594,34 @@ export class InvoicesService {
     return { subtotal, taxableAmount, taxAmount, cgst, sgst, igst, total };
   }
 
+  // Concurrency-safe: previously this counted existing rows with `count()` and used
+  // count+1 — under concurrent requests, two transactions could both count N and both try
+  // to create invoiceNumber N+1, and the second one would fail with Prisma P2002 on the
+  // unique constraint (exactly the reported bug). InvoiceCounter.seq is incremented via an
+  // atomic upsert instead — Postgres row-locks that row for the increment, so two concurrent
+  // callers can never be handed the same seq for the same day. A per-attempt existence check
+  // plus retry loop is layered on top as a defensive backstop (e.g. against pre-existing rows
+  // that don't follow this sequence), per the max-10-attempts requirement.
   private async generateInvoiceNumber(tx: Prisma.TransactionClient): Promise<string> {
     const now = new Date();
-    const prefix = `INV-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
-    const count = await tx.invoice.count({ where: { invoiceNumber: { startsWith: prefix } } });
-    return `${prefix}-${String(count + 1).padStart(5, '0')}`;
+    const dateKey = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+
+    const MAX_ATTEMPTS = 10;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const counter = await tx.invoiceCounter.upsert({
+        where: { dateKey },
+        create: { dateKey, seq: 1 },
+        update: { seq: { increment: 1 } },
+      });
+      const candidate = `INVOICE-${dateKey}-${String(counter.seq).padStart(6, '0')}`;
+
+      const existing = await tx.invoice.findUnique({ where: { invoiceNumber: candidate }, select: { id: true } });
+      if (!existing) return candidate;
+
+      this.logger.warn(`[generateInvoiceNumber] Candidate ${candidate} already exists (attempt ${attempt}/${MAX_ATTEMPTS}) — retrying`);
+    }
+
+    throw new InternalServerErrorException('Unable to generate unique invoice number');
   }
 
   private async recalculateTotals(invoiceId: string): Promise<void> {

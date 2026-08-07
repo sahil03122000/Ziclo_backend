@@ -1270,6 +1270,15 @@ model BookingStatusHistory {
 
 // ─── Invoicing Models ─────────────────────────────────────────────────────────
 
+// Atomic per-day sequence for invoiceNumber generation (INVOICE-YYYYMMDD-000001) — same
+// upsert-with-increment pattern as SupportTicketCounter below. The upsert's row-level lock
+// is what makes concurrent invoice creation safe; two requests in the same transaction-commit
+// window can never be handed the same seq.
+model InvoiceCounter {
+  dateKey String @id // YYYYMMDD
+  seq     Int    @default(0)
+}
+
 model Invoice {
   id            String        @id @default(uuid())
   invoiceNumber String        @unique
