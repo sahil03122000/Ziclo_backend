@@ -105,6 +105,17 @@ const TERMINAL_STATUSES: BookingStatus[] = [
   BookingStatus.COMPLETED, BookingStatus.CANCELLED, BookingStatus.NO_SHOW,
 ];
 
+// Statuses that actually hold a TimeSlot's capacity. PENDING_PAYMENT never appears here —
+// a booking in that status hasn't paid yet and must never block the slot for anyone else.
+// PENDING is included even though the task's requested list only named
+// CONFIRMED/ASSIGNED/IN_PROGRESS: PENDING means "Razorpay payment already verified as
+// successful, awaiting manager confirmation" (see verifyPaymentAndConfirm below) — excluding
+// it would let two different customers both pay for the same slot before a manager gets to
+// confirm either one, which is a worse double-booking bug than the one being fixed here.
+const ACTIVE_BOOKING_STATUSES: BookingStatus[] = [
+  BookingStatus.PENDING, BookingStatus.CONFIRMED, BookingStatus.ASSIGNED, BookingStatus.IN_PROGRESS,
+];
+
 const r2 = (n: number) => parseFloat(n.toFixed(2));
 
 // Booking/payment amounts (totalAmount, advanceAmount, remainingAmount, and the amount
@@ -318,6 +329,11 @@ export class BookingsService {
 
     await this.runQuery('booking status history insert (bookingStatusHistory.create)', () =>
       this.recordStatusHistory(booking.id, BookingStatus.PENDING_PAYMENT, customerId, 'Booking created — awaiting payment'),
+    );
+
+    this.logger.debug(
+      `[create] Booking Status: ${booking.status} | Slot Capacity: n/a | Active Booking Count: n/a | ` +
+        `Remaining Capacity: n/a | Reservation Triggered: false (PENDING_PAYMENT bookings never consume slot capacity)`,
     );
 
     this.auditLogs
@@ -1045,6 +1061,13 @@ export class BookingsService {
       });
       await this.recordStatusHistory(bookingId, BookingStatus.PENDING, actor.id, 'Payment verified — awaiting manager confirmation');
       this.audit(actor.id, bookingId, AuditAction.STATUS_CHANGE, { status: BookingStatus.PENDING, reason: 'payment' });
+
+      // Only now — payment verified successful — does this booking actually reserve slot
+      // capacity. Recompute the slot's active count and flip isAvailable if it's now full.
+      if (booking.timeSlotId) {
+        await this.reconcileSlotAvailability(booking.timeSlotId, BookingStatus.PENDING);
+      }
+
       this.notifications
         .notify(booking.customerId, 'Payment Successful', `Payment received for your booking for ${booking.service.name}.`, { bookingId })
         .catch(() => {});
@@ -1132,26 +1155,74 @@ export class BookingsService {
     };
   }
 
+  // Called at booking creation. A newly created booking is PENDING_PAYMENT — it must be
+  // allowed to exist without consuming capacity, so this only rejects when the slot is
+  // already full of bookings that have actually paid (ACTIVE_BOOKING_STATUSES).
   private async validateAndClaimSlot(timeSlotId: string, serviceId: string): Promise<void> {
     const slot = await this.prisma.timeSlot.findUnique({
       where: { id: timeSlotId },
-      select: { id: true, serviceId: true, isAvailable: true, capacity: true, _count: { select: { bookings: true } } },
+      select: {
+        id: true,
+        serviceId: true,
+        isAvailable: true,
+        capacity: true,
+        _count: { select: { bookings: { where: { status: { in: ACTIVE_BOOKING_STATUSES } } } } },
+      },
     });
     if (!slot) throw new NotFoundException('Time slot not found');
     if (slot.serviceId !== serviceId) throw new BadRequestException('Time slot does not belong to the selected service');
     if (!slot.isAvailable) throw new BadRequestException('Time slot is not available');
-    if (slot._count.bookings >= slot.capacity) throw new BadRequestException('Time slot is fully booked');
+
+    const activeBookingCount = slot._count.bookings;
+    const remainingCapacity = slot.capacity - activeBookingCount;
+    this.logger.debug(
+      `[validateAndClaimSlot] Booking Status: PENDING_PAYMENT (not yet created) | ` +
+        `Slot Capacity: ${slot.capacity} | Active Booking Count: ${activeBookingCount} | ` +
+        `Remaining Capacity: ${remainingCapacity} | Reservation Triggered: false (capacity check only, no reservation happens at creation)`,
+    );
+
+    if (activeBookingCount >= slot.capacity) throw new BadRequestException('Time slot is fully booked');
   }
 
-  private async releaseSlot(timeSlotId: string): Promise<void> {
+  // Called after a booking's payment is verified successful (see verifyPaymentAndConfirm) and
+  // whenever a booking is cancelled/released. Recomputes the slot's active-booking count and
+  // flips TimeSlot.isAvailable to reflect whether it's actually full — this is the only place
+  // isAvailable is now touched automatically; it stays a manual admin override otherwise.
+  private async reconcileSlotAvailability(timeSlotId: string, bookingStatus: BookingStatus): Promise<void> {
     const slot = await this.prisma.timeSlot.findUnique({
       where: { id: timeSlotId },
-      select: { id: true, capacity: true, isAvailable: true, _count: { select: { bookings: true } } },
+      select: {
+        id: true,
+        capacity: true,
+        isAvailable: true,
+        _count: { select: { bookings: { where: { status: { in: ACTIVE_BOOKING_STATUSES } } } } },
+      },
     });
     if (!slot) return;
-    if (!slot.isAvailable && slot._count.bookings <= slot.capacity) {
+
+    const activeBookingCount = slot._count.bookings;
+    const remainingCapacity = slot.capacity - activeBookingCount;
+    const isFull = activeBookingCount >= slot.capacity;
+    const reservationTriggered = isFull && slot.isAvailable;
+
+    this.logger.debug(
+      `[reconcileSlotAvailability] Booking Status: ${bookingStatus} | Slot Capacity: ${slot.capacity} | ` +
+        `Active Booking Count: ${activeBookingCount} | Remaining Capacity: ${remainingCapacity} | ` +
+        `Reservation Triggered: ${reservationTriggered}`,
+    );
+
+    if (isFull && slot.isAvailable) {
+      await this.prisma.timeSlot.update({ where: { id: timeSlotId }, data: { isAvailable: false } });
+    } else if (!isFull && !slot.isAvailable) {
       await this.prisma.timeSlot.update({ where: { id: timeSlotId }, data: { isAvailable: true } });
     }
+  }
+
+  // Kept for the cancel/reschedule call sites — cancelling a booking never increases the
+  // active count, so this always resolves to the "re-open the slot if it has room" branch of
+  // reconcileSlotAvailability above.
+  private async releaseSlot(timeSlotId: string): Promise<void> {
+    await this.reconcileSlotAvailability(timeSlotId, BookingStatus.CANCELLED);
   }
 
   private async generateRef(): Promise<string> {
