@@ -48,18 +48,39 @@ export class RazorpayService {
 
   // ─── Create order ─────────────────────────────────────────────────────────────
 
+  // Bounded to 8s — comfortably under the ~10s the mobile client waits before giving up with
+  // ERR_NETWORK. Previously this https.request had NO timeout at all: if the TCP connection or
+  // TLS handshake to api.razorpay.com stalled, or the socket went idle mid-response, the request
+  // would hang indefinitely with nothing to ever reject/resolve the promise — the exact root
+  // cause of the reported hang. Node's `timeout` option (on the request AND the socket it opens)
+  // fires a 'timeout' event after this many ms of inactivity; without an explicit handler for
+  // that event the socket just sits there, so the fix is both the option AND the handler below.
+  private static readonly REQUEST_TIMEOUT_MS = 8000;
+
   async createOrder(amountInPaise: number, receipt: string): Promise<RazorpayOrder> {
     this.assertConfigured();
 
+    const t0 = Date.now();
     const body  = JSON.stringify({ amount: amountInPaise, currency: 'INR', receipt });
     const creds = Buffer.from(`${this.keyId}:${this.keySecret}`).toString('base64');
 
+    this.logger.debug(
+      `[createOrder] Razorpay HTTP request START (+0ms) — POST https://api.razorpay.com/v1/orders ` +
+        `(timeout=${RazorpayService.REQUEST_TIMEOUT_MS}ms, amountInPaise=${amountInPaise})`,
+    );
+
     return new Promise<RazorpayOrder>((resolve, reject) => {
+      // Guards against the request settling twice (e.g. a 'timeout' firing right as 'end' does)
+      // — without this, both branches would fire their reject/resolve, which is harmless for the
+      // promise itself but would double-log and be actively confusing to debug from.
+      let settled = false;
+
       const req = https.request(
         {
           hostname: 'api.razorpay.com',
           path:     '/v1/orders',
           method:   'POST',
+          timeout:  RazorpayService.REQUEST_TIMEOUT_MS,
           headers:  {
             Authorization:  `Basic ${creds}`,
             'Content-Type': 'application/json',
@@ -70,27 +91,49 @@ export class RazorpayService {
           let raw = '';
           res.on('data', (c) => (raw += c));
           res.on('end', () => {
+            if (settled) return;
+            settled = true;
+            const elapsed = Date.now() - t0;
             try {
               const parsed = JSON.parse(raw) as RazorpayOrder & { error?: { description?: string } };
               if ((res.statusCode ?? 0) >= 400) {
                 const reason = parsed.error?.description ?? res.statusMessage ?? 'Unknown error';
-                this.logger.error(`Razorpay order creation failed: ${reason}`);
+                this.logger.error(`[createOrder] Razorpay HTTP request END (+${elapsed}ms) — FAILED status=${res.statusCode} reason=${reason}`);
                 reject(new BadRequestException(`Razorpay: ${reason}`));
               } else {
-                this.logger.log(`Razorpay order created — orderId: ${parsed.id}, amount: ₹${amountInPaise / 100}, mode: ${this.mode}`);
+                this.logger.log(
+                  `[createOrder] Razorpay HTTP request END (+${elapsed}ms) — orderId: ${parsed.id}, amount: ₹${amountInPaise / 100}, mode: ${this.mode}`,
+                );
                 resolve(parsed);
               }
             } catch {
+              this.logger.error(`[createOrder] Razorpay HTTP request END (+${elapsed}ms) — FAILED to parse response: ${raw.slice(0, 200)}`);
               reject(new BadRequestException('Failed to parse Razorpay response'));
             }
           });
         },
       );
 
+      // Fires after REQUEST_TIMEOUT_MS of inactivity on the socket (connect, TLS handshake, or
+      // an idle response) — this is what turns an indefinite hang into a bounded, explicit
+      // failure. The socket does NOT close itself on 'timeout'; req.destroy() is required.
+      req.on('timeout', () => {
+        if (settled) return;
+        settled = true;
+        const elapsed = Date.now() - t0;
+        this.logger.error(`[createOrder] Razorpay HTTP request TIMED OUT after ${elapsed}ms (limit ${RazorpayService.REQUEST_TIMEOUT_MS}ms) — destroying socket`);
+        req.destroy();
+        reject(new ServiceUnavailableException('Razorpay payment gateway timed out. Please try again.'));
+      });
+
       req.on('error', (err) => {
-        this.logger.error(`Razorpay connection failed: ${err.message}`);
+        if (settled) return;
+        settled = true;
+        const elapsed = Date.now() - t0;
+        this.logger.error(`[createOrder] Razorpay HTTP request ERROR after ${elapsed}ms: ${err.message}`);
         reject(new BadRequestException(`Razorpay connection failed: ${err.message}`));
       });
+
       req.write(body);
       req.end();
     });
