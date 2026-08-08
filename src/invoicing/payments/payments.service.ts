@@ -126,42 +126,46 @@ export class PaymentsService {
     } catch (err) {
       // Never swallowed — logged with elapsed time (so the last logged START/END pair above
       // pinpoints exactly which step was in flight) and rethrown as-is for the global exception
-      // filter / caller to handle.
-      this.logger.error(`[createRazorpayOrder] FAILED after ${Date.now() - t0}ms: ${(err as Error).message}`, (err as Error).stack);
+      // filter / caller to handle. This guarantees an HTTP response is always sent — the request
+      // can never be left hanging past this point.
+      this.logger.error(`[razorpay-order] FAILED after ${Date.now() - t0}ms: ${(err as Error).message}`, (err as Error).stack);
       throw err;
     }
   }
 
   private async createRazorpayOrderInternal(dto: CreateRazorpayOrderDto, actorId: string, orgId: string | undefined, t0: number) {
-    this.logger.debug(`[createRazorpayOrder] payment amount calculation START (+0ms) invoiceId=${dto.invoiceId}`);
+    this.logger.debug(`[razorpay-order] amount calculation START (+${Date.now() - t0}ms) invoiceId=${dto.invoiceId}`);
     const invoice = await this.assertPayableInvoice(dto.invoiceId, orgId);
     // Whole rupees, not paise-precision decimals — the invoice total can carry fractional
     // cents from GST math (e.g. 399 + 18% = 470.82); round to the nearest rupee before this
     // becomes the amount actually charged via Razorpay, so the order is never created for a
     // fractional amount like ₹470.82.
     const outstanding = r0(invoice.total - invoice.paidAmount);
-    this.logger.debug(`[createRazorpayOrder] payment amount calculation END (+${Date.now() - t0}ms) outstanding=${outstanding}`);
+    this.logger.debug(`[razorpay-order] amount calculation END (+${Date.now() - t0}ms) outstanding=${outstanding}`);
 
     if (outstanding <= 0) throw new BadRequestException('Invoice is already fully paid');
 
     const paymentType = dto.paymentType ?? PaymentType.FULL;
     const amountInPaise = outstanding * 100;
 
-    this.logger.debug(`[createRazorpayOrder] Razorpay configuration check (+${Date.now() - t0}ms)`);
+    // Presence-only — never log the actual key/secret values.
+    this.logger.debug(
+      `[razorpay-order] Razorpay configuration check (+${Date.now() - t0}ms) ` +
+        `RAZORPAY_KEY_ID=${this.razorpay.hasKeyId() ? 'present' : 'MISSING'} ` +
+        `RAZORPAY_KEY_SECRET=${this.razorpay.hasKeySecret() ? 'present' : 'MISSING'}`,
+    );
     if (!this.razorpay.isConfigured()) {
       // Fail immediately with a clear status instead of calling createOrder() and letting it
       // discover mid-request that there's nothing to authenticate with — this is the difference
       // between a fast, explicit 503 and an HTTP call that has no chance of ever succeeding.
-      this.logger.error('[createRazorpayOrder] Razorpay is not configured — aborting before making a doomed API call');
+      this.logger.error('[razorpay-order] Razorpay is not configured — aborting before making a doomed API call');
       throw new ServiceUnavailableException('Razorpay payment gateway is not configured.');
     }
-    this.logger.debug(`[createRazorpayOrder] Razorpay configuration check OK (+${Date.now() - t0}ms) mode=${this.razorpay.getMode()}`);
 
-    this.logger.debug(`[createRazorpayOrder] Razorpay API/order creation START (+${Date.now() - t0}ms) amountInPaise=${amountInPaise}`);
+    this.logger.debug(`[razorpay-order] razorpay API START (+${Date.now() - t0}ms) amountInPaise=${amountInPaise}`);
     const order = await this.razorpay.createOrder(amountInPaise, invoice.invoiceNumber);
-    this.logger.debug(`[createRazorpayOrder] Razorpay API/order creation END (+${Date.now() - t0}ms) razorpayOrderId=${order.id}`);
+    this.logger.debug(`[razorpay-order] razorpay API END (+${Date.now() - t0}ms) razorpayOrderId=${order.id}`);
 
-    this.logger.debug(`[createRazorpayOrder] database update (payment + transaction create) START (+${Date.now() - t0}ms)`);
     const payment = await this.prisma.payment.create({
       data: {
         invoiceId: dto.invoiceId,
@@ -181,13 +185,11 @@ export class PaymentsService {
       },
       include: PAYMENT_INCLUDE,
     });
-    this.logger.debug(`[createRazorpayOrder] database update (payment + transaction create) END (+${Date.now() - t0}ms) paymentId=${payment.id}`);
+    this.logger.debug(`[razorpay-order] payment record created (+${Date.now() - t0}ms) paymentId=${payment.id}`);
 
     this.auditLogs
       .log({ actorId, entityType: 'Payment', entityId: payment.id, action: AuditAction.CREATE, newValue: { invoiceId: dto.invoiceId, razorpayOrderId: order.id, paymentType } })
       .catch(() => {});
-
-    this.logger.debug(`[createRazorpayOrder] RETURN response (+${Date.now() - t0}ms total)`);
 
     return {
       success: true,

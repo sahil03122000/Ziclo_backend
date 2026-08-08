@@ -950,43 +950,44 @@ export class BookingsService {
 
   async createPaymentOrder(bookingId: string, customerId: string, paymentType: PaymentType, orgId?: string) {
     const t0 = Date.now();
-    this.logger.debug(`[createPaymentOrder] ENTER (+0ms) bookingId=${bookingId} paymentType=${paymentType}`);
+    this.logger.debug(`[razorpay-order] START bookingId=${bookingId} paymentType=${paymentType} (+0ms)`);
 
     try {
-      this.logger.debug(`[createPaymentOrder] booking lookup START (+${Date.now() - t0}ms)`);
+      this.logger.debug(`[razorpay-order] booking lookup START (+${Date.now() - t0}ms)`);
       const booking = await this.requireBookingWithService(bookingId);
-      this.logger.debug(`[createPaymentOrder] booking lookup END (+${Date.now() - t0}ms) status=${booking.status}`);
+      this.logger.debug(`[razorpay-order] booking lookup END (+${Date.now() - t0}ms) status=${booking.status}`);
 
       this.assertOwner(booking, customerId);
       if (booking.status !== BookingStatus.PENDING_PAYMENT) {
         throw new BadRequestException('This booking is not awaiting payment');
       }
 
-      this.logger.debug(`[createPaymentOrder] advance invoice START (+${Date.now() - t0}ms)`);
+      this.logger.debug(`[razorpay-order] invoice START (+${Date.now() - t0}ms)`);
       const invoice = await this.invoicesService.ensureAdvanceInvoice(bookingId, customerId, paymentType);
-      this.logger.debug(`[createPaymentOrder] advance invoice END (+${Date.now() - t0}ms) invoiceId=${invoice.id} total=${invoice.total}`);
+      this.logger.debug(`[razorpay-order] invoice END (+${Date.now() - t0}ms) invoiceId=${invoice.id} total=${invoice.total}`);
 
-      // Amount calculation, the Razorpay configuration check, and the actual Razorpay
-      // API/order-creation call all happen inside PaymentsService.createRazorpayOrder() — see
-      // its own step-by-step [createRazorpayOrder] logs for the breakdown of this span.
-      this.logger.debug(`[createPaymentOrder] Razorpay order creation START (+${Date.now() - t0}ms)`);
+      // Amount calculation and the Razorpay API call happen inside PaymentsService
+      // .createRazorpayOrder() — it logs its own [razorpay-order] amount calculation and
+      // [razorpay-order] razorpay API markers, so the trace stays linear and complete under
+      // this one prefix regardless of which class emits which step.
       const order = await this.paymentsService.createRazorpayOrder({ invoiceId: invoice.id, paymentType }, customerId, orgId);
-      this.logger.debug(`[createPaymentOrder] Razorpay order creation END (+${Date.now() - t0}ms) razorpayOrderId=${order.data.razorpayOrderId}`);
 
-      this.logger.debug(`[createPaymentOrder] database update START (+${Date.now() - t0}ms)`);
+      this.logger.debug(`[razorpay-order] database update START (+${Date.now() - t0}ms)`);
       // Reset payment tracking for this attempt (e.g. retrying after a previously failed/abandoned order).
       await this.prisma.booking.update({
         where: { id: bookingId },
         data: { paymentStatus: PaymentStatus.CREATED, razorpayOrderId: order.data.razorpayOrderId },
       });
-      this.logger.debug(`[createPaymentOrder] database update END (+${Date.now() - t0}ms)`);
+      this.logger.debug(`[razorpay-order] database update END (+${Date.now() - t0}ms)`);
 
-      this.logger.debug(`[createPaymentOrder] RETURN response (+${Date.now() - t0}ms total)`);
+      this.logger.debug(`[razorpay-order] RESPONSE (+${Date.now() - t0}ms total) razorpayOrderId=${order.data.razorpayOrderId}`);
       return order;
     } catch (err) {
-      // Never swallowed — logged with total elapsed time then rethrown as-is. The last logged
-      // START without a matching END above pinpoints exactly which step was in flight.
-      this.logger.error(`[createPaymentOrder] FAILED after ${Date.now() - t0}ms: ${(err as Error).message}`, (err as Error).stack);
+      // Never swallowed — logged with total elapsed time then rethrown as-is, so this always
+      // reaches the global exception filter and returns an HTTP response (never left hanging).
+      // The last logged START without a matching END above pinpoints exactly which step was
+      // in flight when it failed.
+      this.logger.error(`[razorpay-order] FAILED after ${Date.now() - t0}ms: ${(err as Error).message}`, (err as Error).stack);
       throw err;
     }
   }

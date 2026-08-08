@@ -65,7 +65,7 @@ export class RazorpayService {
     const creds = Buffer.from(`${this.keyId}:${this.keySecret}`).toString('base64');
 
     this.logger.debug(
-      `[createOrder] Razorpay HTTP request START (+0ms) — POST https://api.razorpay.com/v1/orders ` +
+      `[razorpay-order] razorpay API (http) START (+0ms) — POST https://api.razorpay.com/v1/orders ` +
         `(timeout=${RazorpayService.REQUEST_TIMEOUT_MS}ms, amountInPaise=${amountInPaise})`,
     );
 
@@ -98,16 +98,16 @@ export class RazorpayService {
               const parsed = JSON.parse(raw) as RazorpayOrder & { error?: { description?: string } };
               if ((res.statusCode ?? 0) >= 400) {
                 const reason = parsed.error?.description ?? res.statusMessage ?? 'Unknown error';
-                this.logger.error(`[createOrder] Razorpay HTTP request END (+${elapsed}ms) — FAILED status=${res.statusCode} reason=${reason}`);
+                this.logger.error(`[razorpay-order] razorpay API (http) END (+${elapsed}ms) — FAILED status=${res.statusCode} reason=${reason}`);
                 reject(new BadRequestException(`Razorpay: ${reason}`));
               } else {
                 this.logger.log(
-                  `[createOrder] Razorpay HTTP request END (+${elapsed}ms) — orderId: ${parsed.id}, amount: ₹${amountInPaise / 100}, mode: ${this.mode}`,
+                  `[razorpay-order] razorpay API (http) END (+${elapsed}ms) — orderId: ${parsed.id}, amount: ₹${amountInPaise / 100}, mode: ${this.mode}`,
                 );
                 resolve(parsed);
               }
             } catch {
-              this.logger.error(`[createOrder] Razorpay HTTP request END (+${elapsed}ms) — FAILED to parse response: ${raw.slice(0, 200)}`);
+              this.logger.error(`[razorpay-order] razorpay API (http) END (+${elapsed}ms) — FAILED to parse response: ${raw.slice(0, 200)}`);
               reject(new BadRequestException('Failed to parse Razorpay response'));
             }
           });
@@ -121,7 +121,7 @@ export class RazorpayService {
         if (settled) return;
         settled = true;
         const elapsed = Date.now() - t0;
-        this.logger.error(`[createOrder] Razorpay HTTP request TIMED OUT after ${elapsed}ms (limit ${RazorpayService.REQUEST_TIMEOUT_MS}ms) — destroying socket`);
+        this.logger.error(`[razorpay-order] razorpay API (http) TIMED OUT after ${elapsed}ms (limit ${RazorpayService.REQUEST_TIMEOUT_MS}ms) — destroying socket`);
         req.destroy();
         reject(new ServiceUnavailableException('Razorpay payment gateway timed out. Please try again.'));
       });
@@ -130,7 +130,7 @@ export class RazorpayService {
         if (settled) return;
         settled = true;
         const elapsed = Date.now() - t0;
-        this.logger.error(`[createOrder] Razorpay HTTP request ERROR after ${elapsed}ms: ${err.message}`);
+        this.logger.error(`[razorpay-order] razorpay API (http) ERROR after ${elapsed}ms: ${err.message}`);
         reject(new BadRequestException(`Razorpay connection failed: ${err.message}`));
       });
 
@@ -180,6 +180,15 @@ export class RazorpayService {
 
   isConfigured(): boolean {
     return Boolean(this.keyId && this.keySecret);
+  }
+
+  // Presence-only checks for logging — callers must never log the actual key/secret values.
+  hasKeyId(): boolean {
+    return Boolean(this.keyId);
+  }
+
+  hasKeySecret(): boolean {
+    return Boolean(this.keySecret);
   }
 
   // ─── Private ─────────────────────────────────────────────────────────────────
