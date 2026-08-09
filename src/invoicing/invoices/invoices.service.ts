@@ -39,6 +39,18 @@ const INVOICE_INCLUDE: Prisma.InvoiceInclude = {
   },
 };
 
+// ensureAdvanceInvoice()'s only caller (BookingsService.createPaymentOrder) uses just
+// invoice.id and invoice.total — the full INVOICE_INCLUDE above (items, customer, createdBy,
+// booking+service, payments+transactions) forces Prisma into several extra joined round trips
+// per call for data that's immediately discarded. This is the bulk of the ~4.6s invoice step.
+const INVOICE_PAYMENT_ORDER_SELECT = {
+  id: true,
+  invoiceNumber: true,
+  status: true,
+  total: true,
+  payments: { select: { status: true } },
+} satisfies Prisma.InvoiceSelect;
+
 // ─── Math helpers ──────────────────────────────────────────────────────────────
 
 const r2 = (n: number) => parseFloat(n.toFixed(2));
@@ -179,9 +191,18 @@ export class InvoicesService {
   // the newly requested paymentType — used by the Booking Payment flow (paid online, before
   // the job runs), distinct from generateFromBooking above (the post-COMPLETED formal invoice).
   async ensureAdvanceInvoice(bookingId: string, actorId: string, paymentType: PaymentType = PaymentType.ADVANCE) {
+    const t0 = Date.now();
+    this.logger.debug(`[razorpay-order] invoice START (+0ms) bookingId=${bookingId} paymentType=${paymentType}`);
+
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
-      include: { service: { select: { name: true } }, invoice: { select: { id: true } } },
+      select: {
+        customerId: true,
+        totalAmount: true,
+        advanceAmount: true,
+        service: { select: { name: true } },
+        invoice: { select: { id: true } },
+      },
     });
     if (!booking) throw new NotFoundException('Booking not found');
 
@@ -198,10 +219,22 @@ export class InvoicesService {
     const items = [{ description, quantity: 1, unitPrice: amount, taxRate: gstRate, amount: r2(amount) }];
     const taxes = this.computeTaxes(items, 0, gstRate, false);
 
+    // ensureAdvanceInvoice()'s only caller (BookingsService.createPaymentOrder) reads just
+    // invoice.id and invoice.total — INVOICE_PAYMENT_ORDER_SELECT (id/invoiceNumber/status/
+    // total/payments[status]) replaces the previous full INVOICE_INCLUDE (items, customer,
+    // createdBy, booking+service, payments+transactions), which forced several extra joined
+    // round trips per call for data nothing here ever used. This was the bulk of the ~4.6s
+    // invoice step. INVOICE_INCLUDE is still used everywhere else that actually needs it.
     if (booking.invoice) {
-      const existing = await this.prisma.invoice.findUnique({ where: { id: booking.invoice.id }, include: INVOICE_INCLUDE });
+      const existing = await this.prisma.invoice.findUnique({
+        where: { id: booking.invoice.id },
+        select: INVOICE_PAYMENT_ORDER_SELECT,
+      });
       if (!existing) throw new NotFoundException('Invoice not found');
-      if (r2(existing.total) === r2(taxes.total)) return existing;
+      if (r2(existing.total) === r2(taxes.total)) {
+        this.logger.debug(`[razorpay-order] invoice END (+${Date.now() - t0}ms) reused existing invoiceId=${existing.id}`);
+        return existing;
+      }
 
       const hasSuccessfulPayment = existing.payments.some((p) => p.status === PaymentStatus.SUCCESS);
       if (hasSuccessfulPayment || !MUTABLE_STATUSES.includes(existing.status)) {
@@ -209,11 +242,13 @@ export class InvoicesService {
       }
 
       await this.prisma.invoiceItem.deleteMany({ where: { invoiceId: existing.id } });
-      return this.prisma.invoice.update({
+      const updated = await this.prisma.invoice.update({
         where: { id: existing.id },
         data: { ...taxes, items: { create: items } },
-        include: INVOICE_INCLUDE,
+        select: INVOICE_PAYMENT_ORDER_SELECT,
       });
+      this.logger.debug(`[razorpay-order] invoice END (+${Date.now() - t0}ms) rebuilt invoiceId=${updated.id}`);
+      return updated;
     }
 
     const invoice = await this.prisma.$transaction(async (tx) => {
@@ -232,9 +267,10 @@ export class InvoicesService {
           ...taxes,
           items: { create: items },
         },
-        include: INVOICE_INCLUDE,
+        select: INVOICE_PAYMENT_ORDER_SELECT,
       });
     });
+    this.logger.debug(`[razorpay-order] invoice END (+${Date.now() - t0}ms) created invoiceId=${invoice.id}`);
 
     this.auditLogs
       .log({ actorId, entityType: 'Invoice', entityId: invoice.id, action: AuditAction.CREATE, newValue: { invoiceNumber: invoice.invoiceNumber, bookingId, total: invoice.total, kind: paymentType } })

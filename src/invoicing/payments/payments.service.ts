@@ -148,6 +148,47 @@ export class PaymentsService {
     const paymentType = dto.paymentType ?? PaymentType.FULL;
     const amountInPaise = outstanding * 100;
 
+    // Idempotency: reuse an existing pending Razorpay order for this exact invoice/paymentType/
+    // amount instead of creating a new one. This is what makes the endpoint safe against the
+    // realistic duplicate-tap scenario the ~10s frontend timeout causes — the user sees no
+    // response and presses "Pay" again while (or right after) the first attempt is still
+    // completing. A matching PENDING Payment with a still-CREATED (not yet paid/failed)
+    // Transaction means a valid order already exists — no need to call Razorpay again.
+    this.logger.debug(`[razorpay-order] duplicate-order check START (+${Date.now() - t0}ms)`);
+    const reusable = await this.prisma.payment.findFirst({
+      where: { invoiceId: dto.invoiceId, method: PaymentMethod.RAZORPAY, status: PaymentStatus.PENDING, paymentType, amount: outstanding },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        transactions: {
+          where: { status: TransactionStatus.CREATED },
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: { razorpayOrderId: true },
+        },
+      },
+    });
+    const reusableOrderId = reusable?.transactions[0]?.razorpayOrderId;
+    if (reusableOrderId) {
+      this.logger.debug(
+        `[razorpay-order] duplicate-order check END (+${Date.now() - t0}ms) — reusing paymentId=${reusable!.id} razorpayOrderId=${reusableOrderId}`,
+      );
+      return {
+        success: true,
+        message: 'Razorpay order created',
+        data: {
+          paymentId: reusable!.id,
+          razorpayOrderId: reusableOrderId,
+          amount: amountInPaise,
+          currency: 'INR',
+          keyId: this.razorpay.getKeyId(),
+          invoiceNumber: invoice.invoiceNumber,
+          paymentType,
+        },
+      };
+    }
+    this.logger.debug(`[razorpay-order] duplicate-order check END (+${Date.now() - t0}ms) — no reusable order found`);
+
     // Presence-only — never log the actual key/secret values.
     this.logger.debug(
       `[razorpay-order] Razorpay configuration check (+${Date.now() - t0}ms) ` +
@@ -166,6 +207,11 @@ export class PaymentsService {
     const order = await this.razorpay.createOrder(amountInPaise, invoice.invoiceNumber);
     this.logger.debug(`[razorpay-order] razorpay API END (+${Date.now() - t0}ms) razorpayOrderId=${order.id}`);
 
+    // Only paymentId is ever read from this result (see the return below) — PAYMENT_INCLUDE
+    // (transactions + invoice, used by the list/detail endpoints elsewhere in this file) forced
+    // Prisma to do the insert then a follow-up joined SELECT to hydrate data nothing here uses.
+    // `select: { id: true }` skips that entirely. This was the bulk of the ~2.17s payment step.
+    this.logger.debug(`[razorpay-order] payment creation START (+${Date.now() - t0}ms)`);
     const payment = await this.prisma.payment.create({
       data: {
         invoiceId: dto.invoiceId,
@@ -183,9 +229,9 @@ export class PaymentsService {
           },
         },
       },
-      include: PAYMENT_INCLUDE,
+      select: { id: true },
     });
-    this.logger.debug(`[razorpay-order] payment record created (+${Date.now() - t0}ms) paymentId=${payment.id}`);
+    this.logger.debug(`[razorpay-order] payment creation END (+${Date.now() - t0}ms) paymentId=${payment.id}`);
 
     this.auditLogs
       .log({ actorId, entityType: 'Payment', entityId: payment.id, action: AuditAction.CREATE, newValue: { invoiceId: dto.invoiceId, razorpayOrderId: order.id, paymentType } })
