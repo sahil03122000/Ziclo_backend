@@ -1073,33 +1073,62 @@ export class BookingsService {
   }
 
   async verifyPaymentAndConfirm(bookingId: string, dto: VerifyRazorpayDto, actor: AuthUser, orgId?: string) {
-    const booking = await this.requireBookingWithService(bookingId);
-    this.assertOwner(booking, actor.id);
+    const t0 = Date.now();
+    this.logger.debug(`[razorpay-verify] START (+0ms) bookingId=${bookingId} razorpayPaymentId=${dto.razorpayPaymentId}`);
 
-    const result = await this.paymentsService.verifyRazorpay(dto, actor, orgId);
+    try {
+      this.logger.debug(`[razorpay-verify] booking lookup START (+${Date.now() - t0}ms)`);
+      const booking = await this.requireBookingWithService(bookingId);
+      this.logger.debug(`[razorpay-verify] booking lookup END (+${Date.now() - t0}ms) status=${booking.status}`);
+      this.assertOwner(booking, actor.id);
 
-    if (booking.status === BookingStatus.PENDING_PAYMENT) {
-      const updated = await this.prisma.booking.update({
-        where: { id: bookingId },
-        data: { status: BookingStatus.PENDING, paymentStatus: PaymentStatus.SUCCESS },
-        include: BOOKING_INCLUDE,
-      });
-      await this.recordStatusHistory(bookingId, BookingStatus.PENDING, actor.id, 'Payment verified — awaiting manager confirmation');
-      this.audit(actor.id, bookingId, AuditAction.STATUS_CHANGE, { status: BookingStatus.PENDING, reason: 'payment' });
+      // Delegates to PaymentsService.verifyRazorpay(), which logs its own [razorpay-verify]
+      // payment lookup / signature verification / DB transaction / response preparation steps —
+      // see that method for the breakdown of this span. It is itself idempotent: a retried
+      // razorpayPaymentId for an already-SUCCESS payment re-serves the same result instead of
+      // writing anything or erroring, so a client retry after a lost response is always safe.
+      const result = await this.paymentsService.verifyRazorpay(dto, actor, orgId);
+      this.logger.debug(`[razorpay-verify] payment verification complete (+${Date.now() - t0}ms)`);
 
-      // Only now — payment verified successful — does this booking actually reserve slot
-      // capacity. Recompute the slot's active count and flip isAvailable if it's now full.
-      if (booking.timeSlotId) {
-        await this.reconcileSlotAvailability(booking.timeSlotId, BookingStatus.PENDING);
+      if (booking.status === BookingStatus.PENDING_PAYMENT) {
+        this.logger.debug(`[razorpay-verify] booking update START (+${Date.now() - t0}ms)`);
+        const updated = await this.prisma.booking.update({
+          where: { id: bookingId },
+          data: { status: BookingStatus.PENDING, paymentStatus: PaymentStatus.SUCCESS },
+          include: BOOKING_INCLUDE,
+        });
+        this.logger.debug(`[razorpay-verify] booking update END (+${Date.now() - t0}ms)`);
+
+        this.logger.debug(`[razorpay-verify] status history START (+${Date.now() - t0}ms)`);
+        await this.recordStatusHistory(bookingId, BookingStatus.PENDING, actor.id, 'Payment verified — awaiting manager confirmation');
+        this.logger.debug(`[razorpay-verify] status history END (+${Date.now() - t0}ms)`);
+        this.audit(actor.id, bookingId, AuditAction.STATUS_CHANGE, { status: BookingStatus.PENDING, reason: 'payment' });
+
+        // Only now — payment verified successful — does this booking actually reserve slot
+        // capacity. Recompute the slot's active count and flip isAvailable if it's now full.
+        if (booking.timeSlotId) {
+          this.logger.debug(`[razorpay-verify] slot reconciliation START (+${Date.now() - t0}ms)`);
+          await this.reconcileSlotAvailability(booking.timeSlotId, BookingStatus.PENDING);
+          this.logger.debug(`[razorpay-verify] slot reconciliation END (+${Date.now() - t0}ms)`);
+        }
+
+        // Fire-and-forget — never blocks the response.
+        this.notifications
+          .notify(booking.customerId, 'Payment Successful', `Payment received for your booking for ${booking.service.name}.`, { bookingId })
+          .catch(() => {});
+
+        this.logger.debug(`[razorpay-verify] RESPONSE (+${Date.now() - t0}ms total)`);
+        return { success: true, message: 'Payment verified successfully', data: { payment: result.data, booking: updated } };
       }
 
-      this.notifications
-        .notify(booking.customerId, 'Payment Successful', `Payment received for your booking for ${booking.service.name}.`, { bookingId })
-        .catch(() => {});
-      return { success: true, message: 'Payment verified successfully', data: { payment: result.data, booking: updated } };
+      this.logger.debug(`[razorpay-verify] RESPONSE (+${Date.now() - t0}ms total) — booking already past PENDING_PAYMENT, no state change needed`);
+      return { success: true, message: 'Payment verified', data: { payment: result.data, booking } };
+    } catch (err) {
+      // Never swallowed — logged with total elapsed time then rethrown as-is, so this always
+      // reaches the global exception filter and returns an HTTP response (never left hanging).
+      this.logger.error(`[razorpay-verify] FAILED after ${Date.now() - t0}ms: ${(err as Error).message}`, (err as Error).stack);
+      throw err;
     }
-
-    return { success: true, message: 'Payment verified', data: { payment: result.data, booking } };
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────────────

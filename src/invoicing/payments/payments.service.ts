@@ -255,7 +255,10 @@ export class PaymentsService {
   // ─── Razorpay: Verify & Confirm ───────────────────────────────────────────────
 
   async verifyRazorpay(dto: VerifyRazorpayDto, actor: AuthUser, orgId?: string) {
+    const t0 = Date.now();
     const actorId = actor.id;
+
+    this.logger.debug(`[razorpay-verify] payment lookup START (+0ms) paymentId=${dto.paymentId}`);
     const payment = await this.prisma.payment.findUnique({
       where: { id: dto.paymentId },
       include: {
@@ -264,6 +267,8 @@ export class PaymentsService {
           select: {
             id: true,
             invoiceNumber: true,
+            total: true,
+            status: true,
             customerId: true,
             booking: { select: { organizationId: true, totalAmount: true, advanceAmount: true } },
             customer: { select: { organizationId: true } },
@@ -271,6 +276,7 @@ export class PaymentsService {
         },
       },
     });
+    this.logger.debug(`[razorpay-verify] payment lookup END (+${Date.now() - t0}ms) found=${!!payment} status=${payment?.status}`);
 
     if (!payment) throw new NotFoundException('Payment not found');
 
@@ -280,6 +286,28 @@ export class PaymentsService {
       if (paymentOrg !== orgId) throw new NotFoundException('Payment not found');
     }
 
+    // Idempotency: the client may retry after a timeout even though the backend already
+    // finished (this is exactly the reported ERR_NETWORK-after-success symptom — the response
+    // never arrived, so the app retries the same razorpayPaymentId). A previous version threw
+    // a hard 400 "already processed" for ANY non-PENDING status, which meant a legitimate retry
+    // of an already-SUCCESS verification got an error instead of the success payload it expects.
+    // Re-serve the same result instead of erroring, and do it BEFORE the transaction/DB-write
+    // work below runs — no duplicate Payment/Transaction row is ever created either way, since
+    // this branch never reaches the write path.
+    if (payment.status === PaymentStatus.SUCCESS) {
+      const existingTxn = payment.transactions[0];
+      if (existingTxn?.razorpayPaymentId === dto.razorpayPaymentId) {
+        this.logger.debug(`[razorpay-verify] idempotent replay (+${Date.now() - t0}ms) — payment already SUCCESS, same razorpayPaymentId, re-serving result`);
+        const alreadyVerified = await this.prisma.payment.findUnique({ where: { id: dto.paymentId }, include: PAYMENT_INCLUDE });
+        return { success: true, message: 'Payment verified and confirmed', data: alreadyVerified };
+      }
+      // Same payment record but a DIFFERENT razorpayPaymentId being verified against it —
+      // that's a genuine conflict, not a harmless retry.
+      throw new BadRequestException('Payment has already been processed');
+    }
+    if (payment.status === PaymentStatus.FAILED) {
+      throw new BadRequestException('Payment has already failed verification. Please retry payment from the start.');
+    }
     if (payment.status !== PaymentStatus.PENDING) {
       throw new BadRequestException('Payment has already been processed');
     }
@@ -287,9 +315,12 @@ export class PaymentsService {
       throw new BadRequestException('No transaction found for this Razorpay order');
     }
 
+    this.logger.debug(`[razorpay-verify] signature verification START (+${Date.now() - t0}ms)`);
     const isValid = this.razorpay.verifyPaymentSignature(dto.razorpayOrderId, dto.razorpayPaymentId, dto.razorpaySignature);
+    this.logger.debug(`[razorpay-verify] signature verification END (+${Date.now() - t0}ms) valid=${isValid}`);
 
     if (!isValid) {
+      this.logger.debug(`[razorpay-verify] DB transaction START (+${Date.now() - t0}ms) — marking FAILED`);
       await this.prisma.$transaction([
         this.prisma.transaction.update({
           where: { razorpayOrderId: dto.razorpayOrderId },
@@ -301,6 +332,7 @@ export class PaymentsService {
         }),
         this.prisma.payment.update({ where: { id: dto.paymentId }, data: { status: PaymentStatus.FAILED } }),
       ]);
+      this.logger.debug(`[razorpay-verify] DB transaction END (+${Date.now() - t0}ms)`);
 
       this.auditLogs
         .log({ actorId, entityType: 'Payment', entityId: dto.paymentId, action: AuditAction.UPDATE, newValue: { status: 'FAILED', reason: 'signature_mismatch' } })
@@ -327,7 +359,8 @@ export class PaymentsService {
     const paidAmount = paymentType === PaymentType.ADVANCE ? advanceAmount : totalAmount;
     const remainingAmount = paymentType === PaymentType.ADVANCE ? totalAmount - paidAmount : 0;
 
-    await this.prisma.$transaction([
+    this.logger.debug(`[razorpay-verify] DB transaction START (+${Date.now() - t0}ms) — marking SUCCESS`);
+    const [updatedTransaction, updatedPayment] = await this.prisma.$transaction([
       this.prisma.transaction.update({
         where: { razorpayOrderId: dto.razorpayOrderId },
         data: {
@@ -341,10 +374,36 @@ export class PaymentsService {
         data: { status: PaymentStatus.SUCCESS, paidAt: new Date(), paidAmount, remainingAmount },
       }),
     ]);
+    this.logger.debug(`[razorpay-verify] DB transaction END (+${Date.now() - t0}ms)`);
 
+    // Kept synchronous (awaited) — the response below returns invoice.status, and syncPaymentStatus
+    // is what may just have flipped it to PAID/PARTIALLY_PAID, so the client needs the fresh
+    // value, not the pre-payment one fetched at the top of this method. This runs after the
+    // critical transaction above has already committed, so it doesn't hold that transaction open.
+    this.logger.debug(`[razorpay-verify] invoice/payment update START (+${Date.now() - t0}ms)`);
     await this.invoicesService.syncPaymentStatus(payment.invoice.id);
+    const invoiceStatus = await this.prisma.invoice.findUnique({ where: { id: payment.invoice.id }, select: { status: true } });
+    this.logger.debug(`[razorpay-verify] invoice/payment update END (+${Date.now() - t0}ms)`);
 
-    const updated = await this.prisma.payment.findUnique({ where: { id: dto.paymentId }, include: PAYMENT_INCLUDE });
+    // The response's `data` shape is the full PAYMENT_INCLUDE-hydrated payment object (existing
+    // API contract, unchanged) — built here from data already in hand (the payment fetched at
+    // the top of this method + the two update() results + the invoice status just synced above)
+    // instead of firing a third, redundant findUnique re-joining Payment+Transactions+Invoice
+    // for a row whose contents are already fully known at this point.
+    this.logger.debug(`[razorpay-verify] response preparation START (+${Date.now() - t0}ms)`);
+    const updated = {
+      ...payment,
+      ...updatedPayment,
+      transactions: [{ ...payment.transactions[0], ...updatedTransaction }],
+      invoice: {
+        id: payment.invoice.id,
+        invoiceNumber: payment.invoice.invoiceNumber,
+        total: payment.invoice.total,
+        status: invoiceStatus?.status ?? payment.invoice.status,
+        customerId: payment.invoice.customerId,
+      },
+    };
+    this.logger.debug(`[razorpay-verify] response preparation END (+${Date.now() - t0}ms)`);
 
     this.auditLogs
       .log({ actorId, entityType: 'Payment', entityId: dto.paymentId, action: AuditAction.UPDATE, newValue: { status: 'SUCCESS', razorpayPaymentId: dto.razorpayPaymentId } })
@@ -358,6 +417,7 @@ export class PaymentsService {
       metadata: { razorpayPaymentId: dto.razorpayPaymentId, invoiceId: payment.invoice.id },
     });
 
+    this.logger.debug(`[razorpay-verify] RESPONSE (+${Date.now() - t0}ms total)`);
     return { success: true, message: 'Payment verified and confirmed', data: updated };
   }
 
