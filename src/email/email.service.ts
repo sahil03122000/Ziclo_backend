@@ -65,6 +65,14 @@ export interface PaymentReceiptEmailOptions {
   paymentDate: string;
 }
 
+// Whether the provider actually accepted the message — callers that need to know (not just
+// "the method resolved without throwing") should use this instead of assuming success.
+export interface EmailSendResult {
+  accepted: boolean;
+  messageId?: string;
+  error?: string;
+}
+
 @Injectable()
 export class EmailService implements OnModuleInit {
   private readonly logger = new Logger(EmailService.name);
@@ -140,10 +148,10 @@ export class EmailService implements OnModuleInit {
     }
   }
 
-  private async send(to: string, subject: string, html: string, logLabel: string): Promise<void> {
+  private async send(to: string, subject: string, html: string, logLabel: string): Promise<EmailSendResult> {
     if (!this.apiKey || !this.senderEmail) {
       this.logger.warn(`[${logLabel}] Brevo not configured — skipping email to ${to}`);
-      return;
+      return { accepted: false, error: 'Brevo not configured' };
     }
 
     const startedAt = Date.now();
@@ -151,10 +159,11 @@ export class EmailService implements OnModuleInit {
 
     if (!result.ok) {
       this.logger.error(`[${logLabel}] Failed to send email to ${to} after ${Date.now() - startedAt}ms: ${result.error}`);
-      return;
+      return { accepted: false, error: result.error };
     }
 
     this.logger.log(`[${logLabel}] Email sent to ${to} in ${Date.now() - startedAt}ms (messageId=${result.messageId})`);
+    return { accepted: true, messageId: result.messageId };
   }
 
   async sendOtp(to: string, otp: string): Promise<void> {
@@ -197,12 +206,14 @@ export class EmailService implements OnModuleInit {
     }
   }
 
-  async sendBookingConfirmationEmail(opts: BookingConfirmationEmailOptions): Promise<void> {
-    await this.send(opts.to, `Booking Confirmed – ${opts.bookingRef}`, this.buildBookingConfirmationHtml(opts), 'sendBookingConfirmationEmail');
+  // Return the actual send result (not void) — callers that need to prove delivery rather than
+  // just "the method resolved" (e.g. booking confirmation / payment receipt logging) rely on this.
+  async sendBookingConfirmationEmail(opts: BookingConfirmationEmailOptions): Promise<EmailSendResult> {
+    return this.send(opts.to, `Booking Confirmed – ${opts.bookingRef}`, this.buildBookingConfirmationHtml(opts), 'sendBookingConfirmationEmail');
   }
 
-  async sendPaymentReceiptEmail(opts: PaymentReceiptEmailOptions): Promise<void> {
-    await this.send(opts.to, `Payment Receipt – ${opts.bookingRef}`, this.buildPaymentReceiptHtml(opts), 'sendPaymentReceiptEmail');
+  async sendPaymentReceiptEmail(opts: PaymentReceiptEmailOptions): Promise<EmailSendResult> {
+    return this.send(opts.to, `Payment Receipt – ${opts.bookingRef}`, this.buildPaymentReceiptHtml(opts), 'sendPaymentReceiptEmail');
   }
 
   async sendSupportTicketCreatedToCustomer(opts: SupportTicketCustomerEmailOptions): Promise<void> {

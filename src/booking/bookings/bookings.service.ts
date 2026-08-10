@@ -12,6 +12,7 @@ import { ActivityLogService } from '../../activity-log/activity-log.service';
 import { DEFAULTS, SETTING_KEYS } from '../../admin/admin.service';
 import { AuditLogsService } from '../../audit-logs/audit-logs.service';
 import type { AuthUser } from '../../common/types/auth-user.type';
+import { EmailService } from '../../email/email.service';
 import { InvoicesService } from '../../invoicing/invoices/invoices.service';
 import { PaymentsService } from '../../invoicing/payments/payments.service';
 import { VerifyRazorpayDto } from '../../invoicing/payments/dto/verify-razorpay.dto';
@@ -124,6 +125,14 @@ const r2 = (n: number) => parseFloat(n.toFixed(2));
 // customer-facing booking amount fields.
 const r0 = (n: number) => Math.round(n);
 
+// Masks an email for logging — keeps the first character and the domain, e.g.
+// "tiger84300@gmail.com" -> "t*******0@gmail.com". Never log a full recipient address.
+function maskEmail(email: string): string {
+  const [local, domain] = email.split('@');
+  if (!domain || local.length <= 2) return `${local?.[0] ?? '*'}***@${domain ?? 'unknown'}`;
+  return `${local[0]}${'*'.repeat(local.length - 2)}${local[local.length - 1]}@${domain}`;
+}
+
 // ─── Worker job response shaping ───────────────────────────────────────────────
 // Maps a Booking (BOOKING_INCLUDE shape) onto the flat "job" contract the Worker Panel
 // screens (Jobs / Job Details / Start Work / Before-After Image / Payment / Complete Task)
@@ -225,6 +234,7 @@ export class BookingsService {
     private readonly activityLog: ActivityLogService,
     private readonly invoicesService: InvoicesService,
     private readonly paymentsService: PaymentsService,
+    private readonly emailService: EmailService,
   ) {}
 
   // ─── Create ───────────────────────────────────────────────────────────────────
@@ -346,7 +356,7 @@ export class BookingsService {
       actor: { id: customerId, name: booking.customer.name, role: booking.customer.role },
       target: { id: booking.id, type: 'Booking' },
       organizationId: orgId,
-      metadata: { bookingRef: booking.bookingRef, amount: booking.totalAmount, scheduledAt: booking.scheduledAt },
+      metadata: { bookingRef, amount: booking.totalAmount, scheduledAt: booking.scheduledAt },
     });
 
     // Fire-and-forget — never block booking creation on notification delivery.
@@ -1124,6 +1134,20 @@ export class BookingsService {
           .notify(booking.customerId, 'Payment Successful', `Payment received for your booking for ${booking.service.name}.`, { bookingId })
           .catch(() => {});
 
+        // Booking confirmation + payment receipt emails. Root cause of "emails are never
+        // received": these EmailService methods existed but were never called from anywhere in
+        // the booking/payment flow — EmailService wasn't even injected into this service. Fired
+        // here, inside the `booking.status === PENDING_PAYMENT` guard, for the same reason the
+        // status history / notification above are: this block only runs on the ONE request that
+        // actually transitions the booking out of PENDING_PAYMENT. A retried/idempotent-replay
+        // verifyRazorpay call finds booking.status already PENDING and takes the other return
+        // branch entirely, so these never fire twice for the same booking — no extra dedupe
+        // needed. Fire-and-forget: an email provider failure must never surface as a failure of
+        // an already-successful payment.
+        if (result.data) {
+          this.sendPostPaymentEmails(updated, result.data, bookingId).catch(() => {});
+        }
+
         this.logger.debug(`[razorpay-verify] RESPONSE (+${Date.now() - t0}ms total)`);
         return { success: true, message: 'Payment verified successfully', data: { payment: result.data, booking: updated } };
       }
@@ -1202,6 +1226,61 @@ export class BookingsService {
     note?: string,
   ): Promise<void> {
     await this.prisma.bookingStatusHistory.create({ data: { bookingId, status, actorId, note } });
+  }
+
+  // Fires the booking confirmation + payment receipt emails after a successful payment
+  // verification. Never throws — every failure is caught and logged individually so one
+  // email failing can never affect the other, or the (already-returned) payment/booking result.
+  private async sendPostPaymentEmails(
+    booking: { bookingRef: string | null; scheduledAt: Date; totalAmount: number | null; service: { name: string }; customer: { name: string; email: string } },
+    payment: { id: string; paidAmount: number | null; paidAt: Date | null },
+    bookingId: string,
+  ): Promise<void> {
+    const to = booking.customer.email;
+    const maskedTo = maskEmail(to);
+    const bookingRef = booking.bookingRef ?? bookingId;
+
+    const confirmationStartedAt = Date.now();
+    this.logger.log(`[EMAIL] booking confirmation START bookingId=${bookingId} recipient=${maskedTo}`);
+    try {
+      const result = await this.emailService.sendBookingConfirmationEmail({
+        to,
+        name: booking.customer.name,
+        bookingRef,
+        serviceName: booking.service.name,
+        scheduledDate: booking.scheduledAt.toISOString().slice(0, 10),
+        amount: booking.totalAmount != null ? `₹${booking.totalAmount}` : undefined,
+      });
+      const duration = Date.now() - confirmationStartedAt;
+      if (result.accepted) {
+        this.logger.log(`[EMAIL] booking confirmation SENT bookingId=${bookingId} recipient=${maskedTo} messageId=${result.messageId ?? 'n/a'} durationMs=${duration}`);
+      } else {
+        this.logger.error(`[EMAIL] booking confirmation FAILED bookingId=${bookingId} recipient=${maskedTo} durationMs=${duration} reason=${result.error ?? 'unknown'}`);
+      }
+    } catch (err) {
+      this.logger.error(`[EMAIL] booking confirmation FAILED bookingId=${bookingId} recipient=${maskedTo} durationMs=${Date.now() - confirmationStartedAt} reason=${(err as Error).message}`);
+    }
+
+    const receiptStartedAt = Date.now();
+    this.logger.log(`[EMAIL] payment receipt START bookingId=${bookingId} paymentId=${payment.id} recipient=${maskedTo}`);
+    try {
+      const result = await this.emailService.sendPaymentReceiptEmail({
+        to,
+        name: booking.customer.name,
+        bookingRef,
+        paymentId: payment.id,
+        amount: `₹${payment.paidAmount ?? 0}`,
+        paymentDate: (payment.paidAt ?? new Date()).toISOString().slice(0, 10),
+      });
+      const duration = Date.now() - receiptStartedAt;
+      if (result.accepted) {
+        this.logger.log(`[EMAIL] payment receipt SENT bookingId=${bookingId} paymentId=${payment.id} recipient=${maskedTo} messageId=${result.messageId ?? 'n/a'} durationMs=${duration}`);
+      } else {
+        this.logger.error(`[EMAIL] payment receipt FAILED bookingId=${bookingId} paymentId=${payment.id} recipient=${maskedTo} durationMs=${duration} reason=${result.error ?? 'unknown'}`);
+      }
+    } catch (err) {
+      this.logger.error(`[EMAIL] payment receipt FAILED bookingId=${bookingId} paymentId=${payment.id} recipient=${maskedTo} durationMs=${Date.now() - receiptStartedAt} reason=${(err as Error).message}`);
+    }
   }
 
   private async getOrgPaymentSettings(): Promise<{ taxPercentage: number; advancePaymentPercentage: number }> {
