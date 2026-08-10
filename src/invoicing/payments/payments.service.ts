@@ -376,20 +376,26 @@ export class PaymentsService {
     ]);
     this.logger.debug(`[razorpay-verify] DB transaction END (+${Date.now() - t0}ms)`);
 
-    // Kept synchronous (awaited) — the response below returns invoice.status, and syncPaymentStatus
-    // is what may just have flipped it to PAID/PARTIALLY_PAID, so the client needs the fresh
-    // value, not the pre-payment one fetched at the top of this method. This runs after the
-    // critical transaction above has already committed, so it doesn't hold that transaction open.
-    this.logger.debug(`[razorpay-verify] invoice/payment update START (+${Date.now() - t0}ms)`);
-    await this.invoicesService.syncPaymentStatus(payment.invoice.id);
-    const invoiceStatus = await this.prisma.invoice.findUnique({ where: { id: payment.invoice.id }, select: { status: true } });
-    this.logger.debug(`[razorpay-verify] invoice/payment update END (+${Date.now() - t0}ms)`);
+    // Non-blocking: Invoice.status (SENT -> PAID/PARTIALLY_PAID) is a secondary rollup the
+    // client doesn't gate anything on in this response — the fields that matter (payment.status,
+    // paidAmount, remainingAmount) are already committed and correct above. Previously this was
+    // awaited plus a follow-up findUnique just to read the fresh status back — in production that
+    // pair alone measured ~1.4s (see [razorpay-verify] invoice/payment update START/END in the
+    // prior trace), entirely after the critical payment write had already succeeded. Running it
+    // in the background means a slow/contended Invoice update can no longer add latency to an
+    // already-successful payment response, and it can never turn that success into a client-side
+    // failure (requirement: non-critical post-processing must not do that).
+    this.invoicesService
+      .syncPaymentStatus(payment.invoice.id)
+      .catch((err: Error) => this.logger.error(`[razorpay-verify] syncPaymentStatus failed (non-fatal, background): ${err.message}`));
 
     // The response's `data` shape is the full PAYMENT_INCLUDE-hydrated payment object (existing
     // API contract, unchanged) — built here from data already in hand (the payment fetched at
-    // the top of this method + the two update() results + the invoice status just synced above)
-    // instead of firing a third, redundant findUnique re-joining Payment+Transactions+Invoice
-    // for a row whose contents are already fully known at this point.
+    // the top of this method + the two update() results) instead of firing extra redundant
+    // queries for a row whose contents are already fully known at this point. invoice.status is
+    // the pre-payment value (e.g. SENT) since the sync above runs after this response is built;
+    // it will read as PAID/PARTIALLY_PAID within moments on any subsequent fetch of this payment
+    // or invoice — an acceptable, brief eventual-consistency window for this one derived field.
     this.logger.debug(`[razorpay-verify] response preparation START (+${Date.now() - t0}ms)`);
     const updated = {
       ...payment,
@@ -399,7 +405,7 @@ export class PaymentsService {
         id: payment.invoice.id,
         invoiceNumber: payment.invoice.invoiceNumber,
         total: payment.invoice.total,
-        status: invoiceStatus?.status ?? payment.invoice.status,
+        status: payment.invoice.status,
         customerId: payment.invoice.customerId,
       },
     };

@@ -1099,20 +1099,27 @@ export class BookingsService {
         });
         this.logger.debug(`[razorpay-verify] booking update END (+${Date.now() - t0}ms)`);
 
-        this.logger.debug(`[razorpay-verify] status history START (+${Date.now() - t0}ms)`);
-        await this.recordStatusHistory(bookingId, BookingStatus.PENDING, actor.id, 'Payment verified — awaiting manager confirmation');
-        this.logger.debug(`[razorpay-verify] status history END (+${Date.now() - t0}ms)`);
+        // Non-critical post-payment work, moved off the response path. The booking's
+        // status/paymentStatus write above (the fact that matters to the client and to any
+        // other request racing against this one) is already committed. None of the following
+        // — audit-trail history, slot-capacity bookkeeping, the push notification — is
+        // something the client is waiting on or gates any decision on in this response, and a
+        // failure in any of them must never turn this already-successful payment into a
+        // frontend-visible failure (they're logged, not rethrown). Previously these ran
+        // sequentially and awaited before the response — in production that pair alone (status
+        // history + slot reconciliation) measured ~1s on top of an already-slow booking update.
+        this.logger.debug(`[razorpay-verify] queuing background post-processing (+${Date.now() - t0}ms): status history, slot reconciliation, notification`);
+        this.recordStatusHistory(bookingId, BookingStatus.PENDING, actor.id, 'Payment verified — awaiting manager confirmation')
+          .catch((err: Error) => this.logger.error(`[razorpay-verify] recordStatusHistory failed (non-fatal, background): ${err.message}`));
         this.audit(actor.id, bookingId, AuditAction.STATUS_CHANGE, { status: BookingStatus.PENDING, reason: 'payment' });
 
         // Only now — payment verified successful — does this booking actually reserve slot
         // capacity. Recompute the slot's active count and flip isAvailable if it's now full.
         if (booking.timeSlotId) {
-          this.logger.debug(`[razorpay-verify] slot reconciliation START (+${Date.now() - t0}ms)`);
-          await this.reconcileSlotAvailability(booking.timeSlotId, BookingStatus.PENDING);
-          this.logger.debug(`[razorpay-verify] slot reconciliation END (+${Date.now() - t0}ms)`);
+          this.reconcileSlotAvailability(booking.timeSlotId, BookingStatus.PENDING)
+            .catch((err: Error) => this.logger.error(`[razorpay-verify] reconcileSlotAvailability failed (non-fatal, background): ${err.message}`));
         }
 
-        // Fire-and-forget — never blocks the response.
         this.notifications
           .notify(booking.customerId, 'Payment Successful', `Payment received for your booking for ${booking.service.name}.`, { bookingId })
           .catch(() => {});
