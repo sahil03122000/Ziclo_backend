@@ -49,12 +49,31 @@ export class BookingConfigService {
       select: { id: true, name: true },
     });
 
+    let services: { id: string; name: string }[] = [];
+    if (area) {
+      const [allServices, configured] = await this.prisma.$transaction([
+        this.prisma.service.findMany({
+          where: { isActive: true },
+          select: { id: true, name: true },
+          orderBy: { name: 'asc' },
+        }),
+        this.prisma.areaService.findMany({
+          where: { areaId: area.id },
+          select: { serviceId: true, isActive: true },
+        }),
+      ]);
+      const configuredMap = new Map(configured.map((c) => [c.serviceId, c.isActive]));
+      services = allServices.filter((s) => configuredMap.get(s.id) ?? true);
+    }
+
     return {
       success: true,
       data: {
         serviceable: !!area,
         areaId: area?.id ?? null,
         areaName: area?.name ?? null,
+        pincode: address.pincode,
+        services,
       },
     };
   }

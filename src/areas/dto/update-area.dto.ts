@@ -72,6 +72,22 @@ export class UpdateAreaDto {
   @IsBoolean()
   isActive?: boolean;
 
+  @ApiPropertyOptional({
+    type: [String],
+    format: 'uuid',
+    description:
+      'Fully replaces which existing Services are active in this area. Every Service.id in ' +
+      'this list is marked active; every other active Service is marked inactive for this ' +
+      'area. Omit entirely to leave service availability unchanged. An empty array marks all ' +
+      'services inactive for this area.',
+    example: ['a1b2c3d4-e5f6-7890-abcd-ef1234567890'],
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayUnique()
+  @IsUUID('4', { each: true })
+  activeServiceIds?: string[];
+
   // managerId / managerIds are intentionally accepted-but-ignored: manager assignment is
   // now handled exclusively by the Manager Create/Update APIs, not the Area APIs. They're
   // still declared here (with no validation beyond @IsOptional()) purely so a client that

@@ -117,6 +117,39 @@ export class AreasService {
     };
   }
 
+  // Feature 3 — raw pincode -> serviceability + active services. Distinguishes "no open area
+  // for this pincode" (available:false, area:null) from "area open" (available:true, area +
+  // effective active services, using the same fallback as getEffectiveActiveServiceIds).
+  async getServicesForPincode(pincode: string) {
+    const area = await this.prisma.area.findFirst({
+      where: { pincode, isActive: true },
+      select: { id: true, name: true },
+    });
+
+    if (!area) {
+      return { success: true, data: { pincode, available: false, area: null, services: [] } };
+    }
+
+    const [allServices, configured] = await this.prisma.$transaction([
+      this.prisma.service.findMany({
+        where: { isActive: true },
+        select: { id: true, name: true, description: true, thumbnail: true, iconUrl: true },
+        orderBy: { name: 'asc' },
+      }),
+      this.prisma.areaService.findMany({
+        where: { areaId: area.id },
+        select: { serviceId: true, isActive: true },
+      }),
+    ]);
+    const configuredMap = new Map(configured.map((c) => [c.serviceId, c.isActive]));
+    const services = allServices.filter((s) => configuredMap.get(s.id) ?? true);
+
+    return {
+      success: true,
+      data: { pincode, available: true, area, services },
+    };
+  }
+
   async findAll(query: AreaQueryDto) {
     const {
       page = 1,
@@ -165,10 +198,28 @@ export class AreasService {
       this.prisma.area.count({ where }),
     ]);
 
-    const items = areas.map((a) => ({
-      ...a,
-      officeLocationIds: a.officeLocations.map((o) => o.id),
-    }));
+    const areaIds = areas.map((a) => a.id);
+    const [allServices, configured] = await this.prisma.$transaction([
+      this.prisma.service.findMany({ where: { isActive: true }, select: { id: true } }),
+      this.prisma.areaService.findMany({
+        where: { areaId: { in: areaIds } },
+        select: { areaId: true, serviceId: true, isActive: true },
+      }),
+    ]);
+    const configuredByArea = new Map<string, Map<string, boolean>>();
+    for (const c of configured) {
+      if (!configuredByArea.has(c.areaId)) configuredByArea.set(c.areaId, new Map());
+      configuredByArea.get(c.areaId)!.set(c.serviceId, c.isActive);
+    }
+
+    const items = areas.map((a) => {
+      const configuredMap = configuredByArea.get(a.id) ?? new Map<string, boolean>();
+      return {
+        ...a,
+        officeLocationIds: a.officeLocations.map((o) => o.id),
+        activeServiceIds: allServices.filter((s) => configuredMap.get(s.id) ?? true).map((s) => s.id),
+      };
+    });
 
     return {
       success: true,
@@ -185,13 +236,51 @@ export class AreasService {
       },
     });
     if (!area) throw new NotFoundException('Area not found');
+    const activeServiceIds = await this.getEffectiveActiveServiceIds(id);
     return {
       success: true,
       data: {
         ...area,
         officeLocationIds: area.officeLocations.map((o) => o.id),
+        activeServiceIds,
       },
     };
+  }
+
+  // Effectively-active Service ids for an area: explicit AreaService rows win; a Service with
+  // no AreaService row for this area defaults to active (see the module-level comment on
+  // AreaService for why — this is the Feature 7 backward-compatible fallback).
+  private async getEffectiveActiveServiceIds(areaId: string): Promise<string[]> {
+    const [services, configured] = await this.prisma.$transaction([
+      this.prisma.service.findMany({ where: { isActive: true }, select: { id: true } }),
+      this.prisma.areaService.findMany({ where: { areaId }, select: { serviceId: true, isActive: true } }),
+    ]);
+    const configuredMap = new Map(configured.map((c) => [c.serviceId, c.isActive]));
+    return services.filter((s) => configuredMap.get(s.id) ?? true).map((s) => s.id);
+  }
+
+  // Fully replaces which active Services are ON for this area: every id in activeServiceIds is
+  // upserted isActive:true, every other currently-active Service is upserted isActive:false —
+  // mirrors the officeLocationIds "fully replaces" semantics already used by update().
+  private async setActiveServiceIdsInTx(
+    tx: Prisma.TransactionClient,
+    areaId: string,
+    activeServiceIds: string[],
+  ): Promise<void> {
+    const allServices = await tx.service.findMany({ where: { isActive: true }, select: { id: true } });
+    const activeSet = new Set(activeServiceIds);
+    const missing = activeServiceIds.filter((id) => !allServices.some((s) => s.id === id));
+    if (missing.length > 0) throw new NotFoundException(`Service(s) not found: ${missing.join(', ')}`);
+
+    await Promise.all(
+      allServices.map((s) =>
+        tx.areaService.upsert({
+          where: { areaId_serviceId: { areaId, serviceId: s.id } },
+          create: { areaId, serviceId: s.id, isActive: activeSet.has(s.id) },
+          update: { isActive: activeSet.has(s.id) },
+        }),
+      ),
+    );
   }
 
   // Lists every active Service with its effective availability in this area. "Effective" means:
@@ -283,6 +372,7 @@ export class AreasService {
       officeLocationId,
       managerId: _managerId,
       managerIds: _managerIds,
+      activeServiceIds,
       ...rest
     } = dto;
     const areaUpdate: Prisma.AreaUpdateInput = { ...rest };
@@ -358,6 +448,10 @@ export class AreasService {
         workerUserIds = cascade.workerUserIds;
       }
 
+      if (activeServiceIds !== undefined) {
+        await this.setActiveServiceIdsInTx(tx, id, activeServiceIds);
+      }
+
       const offices = await tx.officeLocation.findMany({
         where: { areaId: id },
         select: { id: true, name: true },
@@ -411,6 +505,7 @@ export class AreasService {
         ...area,
         officeLocationIds: officeLocations.map((o) => o.id),
         officeLocations,
+        activeServiceIds: await this.getEffectiveActiveServiceIds(id),
       },
     };
   }

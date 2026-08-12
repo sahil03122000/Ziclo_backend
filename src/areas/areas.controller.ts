@@ -119,6 +119,30 @@ export class AreasController {
     return this.areasService.findAll(query);
   }
 
+  @Get('pincode/:pincode/services')
+  @Roles(Role.ADMIN, Role.MANAGER, Role.USER)
+  @ApiOperation({ summary: 'Serviceability + active services for a raw pincode — ADMIN/MANAGER/USER' })
+  @ApiParam({ name: 'pincode', description: '6-digit PIN Code' })
+  @ApiResponse({
+    status: 200,
+    description: 'Serviceability result',
+    schema: {
+      example: {
+        success: true,
+        data: {
+          pincode: '301001',
+          available: true,
+          area: { id: 'uuid', name: 'Alwar' },
+          services: [{ id: 'uuid', name: 'AC Cleaning' }],
+        },
+      },
+    },
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  getServicesForPincode(@Param('pincode') pincode: string) {
+    return this.areasService.getServicesForPincode(pincode);
+  }
+
   @Get(':id')
   @Roles(Role.ADMIN)
   @ApiOperation({ summary: 'Area detail with office locations — ADMIN' })
