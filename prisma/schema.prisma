@@ -401,6 +401,7 @@ model Area {
   managerAreas    ManagerArea[]
   workerProfiles  WorkerProfile[]
   tasks           Task[]
+  areaServices    AreaService[]
 
   @@unique([name, pincode])
   @@index([pincode])
@@ -1035,9 +1036,30 @@ model Service {
   timeSlots         TimeSlot[]
   bookings          Booking[]
   workerCommissions WorkerCommission[]
+  areaServices      AreaService[]
 
   @@index([isActive])
   @@index([categoryId])
+}
+
+// Per-area service availability — admin-configurable ON/OFF per (Area, Service) pair. Absence
+// of a row for a given Area is NOT "no services available": see AreasService/BookingConfigService
+// for the backward-compatible fallback (an area with zero AreaService rows offers every active
+// Service, exactly as before this feature existed — only areas an admin has actually configured
+// are restricted to the selected subset).
+model AreaService {
+  id        String   @id @default(uuid())
+  areaId    String
+  area      Area     @relation(fields: [areaId], references: [id], onDelete: Cascade)
+  serviceId String
+  service   Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([areaId, serviceId])
+  @@index([areaId])
+  @@index([serviceId])
 }
 
 // ─── Website — Module 2 (Website Services) ────────────────────────────────────

@@ -298,6 +298,23 @@ export class BookingsService {
       throw new BadRequestException('Invalid address');
     }
 
+    await this.runQuery('service area + area-service availability check', async () => {
+      const area = await this.prisma.area.findFirst({
+        where: { pincode: address.pincode, isActive: true },
+        select: { id: true },
+      });
+      if (!area) {
+        throw new BadRequestException('Ziclo isn\'t available in this area yet.');
+      }
+      const areaService = await this.prisma.areaService.findUnique({
+        where: { areaId_serviceId: { areaId: area.id, serviceId: dto.serviceId } },
+        select: { isActive: true },
+      });
+      if (areaService && !areaService.isActive) {
+        throw new BadRequestException('This service is not available in your area');
+      }
+    });
+
     const bookingRef = await this.runQuery('booking ref generation (booking.count)', () => this.generateRef());
     // Same GST-inclusive total previewPrice() shows the customer before they book (servicePrice
     // + tax, rounded to the nearest rupee) — booking.totalAmount must match what was previewed,

@@ -11,6 +11,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AreaQueryDto } from './dto/area-query.dto';
 import { CreateAreaDto } from './dto/create-area.dto';
 import { UpdateAreaDto } from './dto/update-area.dto';
+import { UpdateAreaServicesDto } from './dto/update-area-services.dto';
 
 @Injectable()
 export class AreasService {
@@ -191,6 +192,75 @@ export class AreasService {
         officeLocationIds: area.officeLocations.map((o) => o.id),
       },
     };
+  }
+
+  // Lists every active Service with its effective availability in this area. "Effective" means:
+  // if an AreaService row exists, use it; otherwise default to true. That default is what keeps
+  // areas nobody has ever configured behaving exactly as they did before this feature existed
+  // (every active service available everywhere) — see the module-level comment on AreaService.
+  async getAreaServices(areaId: string) {
+    const area = await this.prisma.area.findUnique({ where: { id: areaId }, select: { id: true } });
+    if (!area) throw new NotFoundException('Area not found');
+
+    const [services, configured] = await this.prisma.$transaction([
+      this.prisma.service.findMany({
+        where: { isActive: true },
+        select: { id: true, name: true },
+        orderBy: { name: 'asc' },
+      }),
+      this.prisma.areaService.findMany({
+        where: { areaId },
+        select: { serviceId: true, isActive: true },
+      }),
+    ]);
+
+    const configuredMap = new Map(configured.map((c) => [c.serviceId, c.isActive]));
+    return {
+      success: true,
+      data: services.map((s) => ({
+        serviceId: s.id,
+        serviceName: s.name,
+        isActive: configuredMap.get(s.id) ?? true,
+      })),
+    };
+  }
+
+  // Upserts one AreaService row per entry — this is how an area moves from "unconfigured / all
+  // services available" to "explicitly restricted to the selected subset". Never deletes rows
+  // for services not mentioned in the payload, so a partial update only touches what's sent.
+  async setAreaServices(areaId: string, dto: UpdateAreaServicesDto, actorId?: string, actorName = 'Admin') {
+    const area = await this.prisma.area.findUnique({ where: { id: areaId }, select: { id: true, name: true } });
+    if (!area) throw new NotFoundException('Area not found');
+
+    const serviceIds = dto.services.map((s) => s.serviceId);
+    const foundServices = await this.prisma.service.findMany({
+      where: { id: { in: serviceIds } },
+      select: { id: true },
+    });
+    const foundIds = new Set(foundServices.map((s) => s.id));
+    const missing = serviceIds.filter((id) => !foundIds.has(id));
+    if (missing.length > 0) throw new NotFoundException(`Service(s) not found: ${missing.join(', ')}`);
+
+    await this.prisma.$transaction(
+      dto.services.map((entry) =>
+        this.prisma.areaService.upsert({
+          where: { areaId_serviceId: { areaId, serviceId: entry.serviceId } },
+          create: { areaId, serviceId: entry.serviceId, isActive: entry.isActive },
+          update: { isActive: entry.isActive },
+        }),
+      ),
+    );
+
+    this.activityLog.log({
+      action: ActivityAction.AREA_UPDATED,
+      module: ActivityModule.AREA,
+      description: `Active services updated for area "${area.name}"`,
+      actor: { id: actorId, name: actorName, role: 'ADMIN' },
+      target: { id: areaId, type: 'Area' },
+      metadata: { services: dto.services },
+    });
+
+    return this.getAreaServices(areaId);
   }
 
   async update(id: string, dto: UpdateAreaDto, actorId?: string, actorName = 'Admin') {

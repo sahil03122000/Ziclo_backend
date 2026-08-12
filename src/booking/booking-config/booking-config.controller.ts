@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
 
@@ -60,5 +60,29 @@ export class BookingConfigController {
   @ApiResponse({ status: 403, description: 'Forbidden — USER required' })
   checkServiceArea(@Body() dto: CheckServiceAreaDto, @CurrentUser() user: AuthUser) {
     return this.bookingConfigService.checkServiceArea(dto, user.id);
+  }
+
+  @Get('service-availability/:pincode')
+  @Roles(Role.USER)
+  @ApiOperation({ summary: 'Check service availability and active services for a pincode — USER' })
+  @ApiResponse({
+    status: 200,
+    description: 'Availability result for the pincode',
+    schema: {
+      example: {
+        success: true,
+        data: {
+          pincode: '301001',
+          available: true,
+          message: 'Ziclo is available in this area.',
+          services: [{ id: 'uuid', name: 'AC Cleaning', thumbnail: null, iconUrl: null }],
+        },
+      },
+    },
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 403, description: 'Forbidden — USER required' })
+  checkPincodeAvailability(@Param('pincode') pincode: string) {
+    return this.bookingConfigService.checkPincodeAvailability(pincode);
   }
 }

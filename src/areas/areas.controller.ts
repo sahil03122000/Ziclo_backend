@@ -22,6 +22,7 @@ import { AreasService } from './areas.service';
 import { AreaQueryDto } from './dto/area-query.dto';
 import { CreateAreaDto } from './dto/create-area.dto';
 import { UpdateAreaDto } from './dto/update-area.dto';
+import { UpdateAreaServicesDto } from './dto/update-area-services.dto';
 
 @ApiTags('Areas')
 @ApiBearerAuth('JWT')
@@ -163,6 +164,55 @@ export class AreasController {
   @ApiResponse({ status: 404, description: 'Area or office location not found' })
   update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateAreaDto, @CurrentUser() user: AuthUser) {
     return this.areasService.update(id, dto, user.id, user.name);
+  }
+
+  @Get(':id/services')
+  @Roles(Role.ADMIN)
+  @ApiOperation({
+    summary: 'List services with per-area availability — ADMIN',
+    description:
+      'Returns every active Service with an isActive flag for this area. If the area has no ' +
+      'explicit AreaService configuration for a service, it defaults to isActive:true (all ' +
+      'active services are available until an admin restricts them).',
+  })
+  @ApiParam({ name: 'id', description: 'Area UUID', format: 'uuid' })
+  @ApiResponse({
+    status: 200,
+    description: 'Service availability for the area',
+    schema: {
+      example: {
+        success: true,
+        data: [{ serviceId: 'uuid', serviceName: 'AC Cleaning', isActive: true }],
+      },
+    },
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 403, description: 'Forbidden — ADMIN required' })
+  @ApiResponse({ status: 404, description: 'Area not found' })
+  getAreaServices(@Param('id', ParseUUIDPipe) id: string) {
+    return this.areasService.getAreaServices(id);
+  }
+
+  @Patch(':id/services')
+  @Roles(Role.ADMIN)
+  @ApiOperation({
+    summary: 'Set which services are active in an area — ADMIN',
+    description:
+      'Upserts ON/OFF status for the given services in this area. Services not included in the ' +
+      'payload are left unchanged. Does not duplicate service records.',
+  })
+  @ApiParam({ name: 'id', description: 'Area UUID', format: 'uuid' })
+  @ApiResponse({ status: 200, description: 'Updated service availability for the area' })
+  @ApiResponse({ status: 400, description: 'Validation error' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 403, description: 'Forbidden — ADMIN required' })
+  @ApiResponse({ status: 404, description: 'Area or one or more services not found' })
+  setAreaServices(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateAreaServicesDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.areasService.setAreaServices(id, dto, user.id, user.name);
   }
 
   @Delete(':id')
