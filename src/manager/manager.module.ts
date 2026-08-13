@@ -6,6 +6,7 @@ import { AttendanceModule } from '../attendance/attendance.module';
 import { BookingsModule } from '../booking/bookings/bookings.module';
 import { DashboardModule } from '../dashboard/dashboard.module';
 import { LeavePolicyModule } from '../leave-policy/leave-policy.module';
+import { LeaveRequestModule } from '../leave-request/leave-request.module';
 import { ReportsModule } from '../reports/reports.module';
 import { SupportModule } from '../support/support.module';
 import { TasksModule } from '../tasks/tasks.module';
@@ -28,6 +29,7 @@ import { ManagerService } from './manager.service';
     AreasModule,
     BookingsModule,
     LeavePolicyModule,
+    LeaveRequestModule,
   ],
   controllers: [
     ManagerController,

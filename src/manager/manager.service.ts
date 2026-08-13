@@ -463,17 +463,46 @@ export class ManagerService {
       : { areaId: { in: areaIds } };
   }
 
-  // A job (Booking) belongs to this manager either because it's directly assigned to them
-  // (Booking.managerId) or because it was performed by one of their own workers — reuses
-  // resolveWorkerFilter rather than re-deriving area/pincode scope.
+  // Same manager scope as getManagerScope/resolveWorkerFilter, but resolved to the actual
+  // pincode STRING values (Address.pincode and Area.pincode are both plain strings — there is
+  // no FK between them, they're only ever matched by value, same as the existing Area/Pincode
+  // availability feature). Needed to match a Booking's own customer Address against the
+  // manager's territory, independent of whether any worker has been assigned yet. Prefers
+  // direct ManagerPincode assignments over ManagerArea (same precedence resolveWorkerFilter
+  // already uses); returns [] (no filter contribution) when the manager has neither configured.
+  private async resolveManagerPincodes(managerUserId: string): Promise<string[]> {
+    const profile = await this.prisma.managerProfile.findUnique({
+      where: { userId: managerUserId },
+      select: {
+        pincodes: { select: { pincode: { select: { pincode: true } } } },
+        areas: { select: { area: { select: { pincode: true } } } },
+      },
+    });
+    if (!profile) return [];
+    if (profile.pincodes.length > 0) return profile.pincodes.map((p) => p.pincode.pincode);
+    return profile.areas.map((a) => a.area.pincode);
+  }
+
+  // A job (Booking) belongs to this manager because: it's directly assigned to them
+  // (Booking.managerId), it was performed by one of their own workers (reuses
+  // resolveWorkerFilter), OR — root cause of "Manager Jobs doesn't show requests raised by
+  // users whose pincode belongs to that manager" — the booking's own customer Address.pincode
+  // falls within the manager's assigned area/pincode territory. That third branch is what
+  // makes brand-new, still-unassigned bookings (managerId null, workerId null, status PENDING)
+  // visible to the correct manager the moment they're created, instead of only ever appearing
+  // once explicitly assigned to that manager or one of their workers.
   private async resolveManagerBookingScope(
     managerUserId: string,
   ): Promise<Prisma.BookingWhereInput> {
-    const workerFilter = await this.resolveWorkerFilter(managerUserId);
+    const [workerFilter, pincodes] = await Promise.all([
+      this.resolveWorkerFilter(managerUserId),
+      this.resolveManagerPincodes(managerUserId),
+    ]);
     return {
       OR: [
         { managerId: managerUserId },
         { worker: { workerProfile: workerFilter } },
+        ...(pincodes.length > 0 ? [{ address: { pincode: { in: pincodes } } }] : []),
       ],
     };
   }
@@ -2129,9 +2158,10 @@ export class ManagerService {
 
     if (workerId) await this.authorizeWorker(user.id, workerId);
 
-    // areaId/officeLocationId narrow within the manager's own scope — never outside it.
-    // Bookings have no direct area/office column (only derivable via the assigned worker),
-    // so this only ever matches already-assigned jobs.
+    // areaId/officeLocationId narrow within the manager's own scope — never outside it. Matches
+    // either the assigned worker's area (already-assigned jobs) OR the booking's own address
+    // pincode against the selected area(s)' pincode (unassigned jobs whose customer is in that
+    // area) — same reasoning as resolveManagerBookingScope below.
     let areaFilterIds: string[] | undefined;
     if (areaId || officeLocationId) {
       const { areaIds: managerAreaIds } = await this.getManagerScope(user.id);
@@ -2163,35 +2193,51 @@ export class ManagerService {
     }
 
     const scope = await this.resolveManagerBookingScope(user.id);
-    const where: Prisma.BookingWhereInput = {
-      ...scope,
-      ...(status ? { status } : {}),
-      ...(serviceId ? { serviceId } : {}),
-      ...(workerId ? { workerId } : {}),
-      ...(customerId ? { customerId } : {}),
-      ...(areaFilterIds
-        ? { worker: { workerProfile: { areaId: { in: areaFilterIds } } } }
-        : {}),
-      ...(startDate || endDate
-        ? {
-            scheduledAt: {
-              ...(startDate ? { gte: new Date(startDate) } : {}),
-              ...(endDate ? { lte: new Date(endDate) } : {}),
-            },
-          }
-        : {}),
-      ...(search
-        ? {
-            OR: [
-              { bookingRef: { contains: search, mode: 'insensitive' } },
-              {
-                customer: { name: { contains: search, mode: 'insensitive' } },
-              },
-              { service: { name: { contains: search, mode: 'insensitive' } } },
-            ],
-          }
-        : {}),
-    };
+
+    // Built as AND: [...] rather than flat object-spread — scope, the areaFilter narrowing, and
+    // the search clause below each contribute their own `OR`, and a plain `{...a, ...b}` spread
+    // would silently let whichever one is written last completely replace the others' `OR`
+    // (in the previous version, `search`'s OR always overwrote `scope`'s OR, which meant a
+    // search query bypassed the manager's own scope entirely). AND: [] keeps every condition
+    // independently enforced regardless of how many of them use OR internally.
+    const andConditions: Prisma.BookingWhereInput[] = [scope];
+    if (status) andConditions.push({ status });
+    if (serviceId) andConditions.push({ serviceId });
+    if (workerId) andConditions.push({ workerId });
+    if (customerId) andConditions.push({ customerId });
+    if (areaFilterIds) {
+      const areaPincodes = await this.prisma.area.findMany({
+        where: { id: { in: areaFilterIds } },
+        select: { pincode: true },
+      });
+      andConditions.push({
+        OR: [
+          { worker: { workerProfile: { areaId: { in: areaFilterIds } } } },
+          ...(areaPincodes.length > 0
+            ? [{ address: { pincode: { in: areaPincodes.map((a) => a.pincode) } } }]
+            : []),
+        ],
+      });
+    }
+    if (startDate || endDate) {
+      andConditions.push({
+        scheduledAt: {
+          ...(startDate ? { gte: new Date(startDate) } : {}),
+          ...(endDate ? { lte: new Date(endDate) } : {}),
+        },
+      });
+    }
+    if (search) {
+      andConditions.push({
+        OR: [
+          { bookingRef: { contains: search, mode: 'insensitive' } },
+          { customer: { name: { contains: search, mode: 'insensitive' } } },
+          { service: { name: { contains: search, mode: 'insensitive' } } },
+        ],
+      });
+    }
+
+    const where: Prisma.BookingWhereInput = { AND: andConditions };
 
     const [bookings, total] = await this.prisma.$transaction([
       this.prisma.booking.findMany({

@@ -128,7 +128,47 @@ export class LeaveRequestService {
     return { success: true, message: 'Leave request cancelled' };
   }
 
-  // ─── Manager ──────────────────────────────────────────────────────────────────
+  // ─── Manager (own leave) ──────────────────────────────────────────────────────
+  // Reuses the exact same WorkerLeaveRequest model/table as applyLeave() above — a manager's
+  // own leave is stored the same way (workerId column holds whichever user actually applied,
+  // worker or manager). Differs only in approver resolution: a worker's request starts at
+  // MANAGER level via resolveManagerUserId(); a manager has no one above them but ADMIN, so
+  // their own request skips straight to ADMIN level (managerId stays null) — it then flows
+  // through the existing, unmodified adminList/adminApprove/adminReject endpoints.
+
+  async applyManagerLeave(userId: string, dto: ApplyLeaveDto) {
+    const existing = await this.prisma.workerLeaveRequest.findFirst({
+      where: { workerId: userId, date: new Date(dto.date), status: LeaveRequestStatus.PENDING },
+      select: { id: true },
+    });
+    if (existing) throw new BadRequestException('A pending leave request already exists for this date');
+
+    const leave = await this.prisma.workerLeaveRequest.create({
+      data: {
+        workerId: userId,
+        date: new Date(dto.date),
+        type: dto.type,
+        reason: dto.reason,
+        managerId: null,
+        currentLevel: LeaveApprovalLevel.ADMIN,
+        adminApprovalRequired: true,
+      },
+    });
+
+    this.auditLogs
+      .log({
+        actorId: userId,
+        entityType: 'WorkerLeaveRequest',
+        entityId: leave.id,
+        action: AuditAction.CREATE,
+        newValue: { date: dto.date, type: dto.type },
+      })
+      .catch(() => {});
+
+    return { success: true, message: 'Leave request submitted', data: this.toLeaveDto(leave) };
+  }
+
+  // ─── Manager (team) ───────────────────────────────────────────────────────────
 
   async managerList(actor: AuthUser, query: QueryLeaveRequestsDto) {
     return this.listRequests(

@@ -1,7 +1,8 @@
-import { Controller, Get, Query, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Post, Query, Req, UseGuards } from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiOperation,
+  ApiParam,
   ApiResponse,
   ApiTags,
 } from '@nestjs/swagger';
@@ -14,6 +15,8 @@ import { Roles } from '../common/decorators/roles.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RoleGuard } from '../common/guards/role.guard';
 import { AuthUser } from '../common/types/auth-user.type';
+import { ApplyLeaveDto } from '../leave-request/dto/apply-leave.dto';
+import { LeaveRequestService } from '../leave-request/leave-request.service';
 import { ManagerAreaQueryDto } from './dto/manager-area-query.dto';
 import { ManagerService } from './manager.service';
 
@@ -23,7 +26,44 @@ import { ManagerService } from './manager.service';
 @Roles(Role.MANAGER)
 @Controller('managers/me')
 export class ManagerController {
-  constructor(private readonly managerService: ManagerService) {}
+  constructor(
+    private readonly managerService: ManagerService,
+    private readonly leaveRequestService: LeaveRequestService,
+  ) {}
+
+  @Post('leaves')
+  @ApiOperation({
+    summary: "Raise the logged-in manager's own leave request — MANAGER",
+    description:
+      'Same WorkerLeaveRequest model/flow as the Worker Panel leave request. A manager has no ' +
+      "one above them but an admin, so this request skips manager-level approval and goes " +
+      "straight to ADMIN — it appears in the existing GET admin/leave-requests list.",
+  })
+  @ApiResponse({ status: 201, description: 'Leave request submitted' })
+  @ApiResponse({ status: 400, description: 'A pending leave request already exists for this date' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  applyLeave(@CurrentUser() user: AuthUser, @Body() dto: ApplyLeaveDto) {
+    return this.leaveRequestService.applyManagerLeave(user.id, dto);
+  }
+
+  @Get('leaves')
+  @ApiOperation({ summary: "Logged-in manager's own leave request history — MANAGER" })
+  @ApiResponse({ status: 200, description: 'Leave request list' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  getMyLeaves(@CurrentUser() user: AuthUser) {
+    return this.leaveRequestService.getMyLeaves(user.id);
+  }
+
+  @Delete('leaves/:id')
+  @ApiParam({ name: 'id', format: 'uuid' })
+  @ApiOperation({ summary: "Cancel the logged-in manager's own pending leave request — MANAGER" })
+  @ApiResponse({ status: 200, description: 'Leave request cancelled' })
+  @ApiResponse({ status: 400, description: 'Only a pending leave request can be cancelled' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Leave request not found' })
+  cancelLeave(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthUser) {
+    return this.leaveRequestService.cancelLeave(user.id, id);
+  }
 
   @Get('dashboard')
   @ApiOperation({
