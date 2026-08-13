@@ -487,13 +487,27 @@ export class BookingsService {
     if (actor?.role === Role.USER) this.assertOwner(booking, actor.id);
 
     const totalAmount = r0(booking.totalAmount ?? 0);
-    const paidFromInvoice = booking.invoice
-      ? r2(booking.invoice.payments.reduce((sum, p) => sum + p.amount, 0))
-      : null;
-    // Fallback to Booking.paidAmount only when there's no invoice/payment history to sum —
-    // covers bookings verified through the older simplified verify flow. Never advanceAmount:
-    // that's the amount that was DUE, not what was actually paid.
-    const paidAmount = r0(paidFromInvoice ?? booking.paidAmount ?? 0);
+    // Sum of actually-SUCCESS payments on this booking's invoice is the authoritative "amount
+    // paid online" — same source assertPayableInvoice() already treats as ground truth when
+    // computing outstanding balance for a new Razorpay order. booking.paidAmount is only a
+    // fallback for the rare case a booking has no invoice at all (e.g. legacy data) — it must
+    // never take priority over the real payment ledger, and it must never be skipped just
+    // because the online-paid sum is legitimately 0 (an invoice with no successful payments yet
+    // really has paid 0, so this is an invoice-exists check, not a truthiness check on the sum).
+    const onlinePaid = r0(
+      booking.invoice
+        ? r2(booking.invoice.payments.reduce((sum, p) => sum + p.amount, 0))
+        : (booking.paidAmount ?? 0),
+    );
+    // Booking.paymentCollectedAt is set by the WORKER's in-person "Payment" step
+    // (collectPayment, Worker Panel: Payment step) once the outstanding job-time balance
+    // (cash/UPI QR) has been collected. That step only ever records a method, not a partial
+    // amount — there is no supported flow for paying a booking's remaining balance online after
+    // its advance (ensureAdvanceInvoice() explicitly rejects switching an invoice's payment type
+    // once it already has a successful payment). So for any booking where the worker has
+    // confirmed in-person collection, the true paidAmount is the full totalAmount — reading an
+    // already-recorded real event, not fabricating a number.
+    const paidAmount = booking.paymentCollectedAt ? totalAmount : onlinePaid;
     const remainingAmount = Math.max(0, totalAmount - paidAmount);
     const latestPayment = booking.invoice?.payments[0];
 
@@ -523,6 +537,12 @@ export class BookingsService {
           method: latestPayment?.method ?? booking.paymentMethod ?? null,
           paidAt: latestPayment?.paidAt ?? booking.paidAt ?? null,
           transactionId: latestPayment?.transactions[0]?.razorpayPaymentId ?? booking.razorpayPaymentId ?? null,
+          // The in-person (cash/QR) leg, if any — kept separate from the online status/method/
+          // transactionId above rather than overwritten into them, since a cash collection has
+          // no transaction id and reusing those fields for it would misrepresent it as an online
+          // payment. These are the same Booking columns collectPayment() already writes.
+          paymentCollectionMethod: booking.paymentCollectionMethod,
+          paymentCollectedAt: booking.paymentCollectedAt,
         },
         invoice: booking.invoice
           ? {
