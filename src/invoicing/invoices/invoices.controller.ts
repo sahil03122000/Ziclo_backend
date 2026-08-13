@@ -228,13 +228,13 @@ export class InvoicesController {
 
   @Get(':id/pdf')
   @Roles(Role.ADMIN, Role.MANAGER, Role.USER)
-  @ApiOperation({ summary: 'Return the PDF URL for an invoice (if generated)' })
+  @ApiOperation({ summary: 'Return the PDF URL for an invoice — generates it on first request if missing' })
   @ApiParam({ name: 'id', description: 'Invoice UUID', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'PDF URL', schema: { example: { success: true, data: { pdfUrl: 'https://...', generatedAt: '2026-06-21T10:00:00Z' } } } })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
-  @ApiResponse({ status: 404, description: 'Invoice not found or PDF not yet generated' })
-  getPdf(@Param('id', ParseUUIDPipe) id: string) {
-    return this.invoicesService.getPdf(id);
+  @ApiResponse({ status: 404, description: 'Invoice not found' })
+  getPdf(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthUser) {
+    return this.invoicesService.getPdf(id, user);
   }
 
   @Patch(':id/cancel')

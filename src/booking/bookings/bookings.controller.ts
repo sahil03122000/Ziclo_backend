@@ -291,8 +291,8 @@ export class BookingsController {
   })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   @ApiResponse({ status: 404, description: 'Booking not found' })
-  getSummary(@Param('id', ParseUUIDPipe) id: string) {
-    return this.bookingsService.getSummary(id);
+  getSummary(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthUser) {
+    return this.bookingsService.getSummary(id, user);
   }
 
   @Patch(':id')

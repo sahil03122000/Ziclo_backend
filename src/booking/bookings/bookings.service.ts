@@ -95,7 +95,11 @@ const BOOKING_DETAIL_INCLUDE = {
 
 const ALLOWED_TRANSITIONS: Partial<Record<BookingStatus, BookingStatus[]>> = {
   [BookingStatus.PENDING_PAYMENT]: [BookingStatus.PENDING, BookingStatus.CANCELLED],
-  [BookingStatus.PENDING]:     [BookingStatus.CONFIRMED, BookingStatus.CANCELLED],
+  // RESCHEDULED is reachable from PENDING too — the controller has always documented reschedule
+  // as "PENDING / CONFIRMED -> RESCHEDULED", but this map only listed CONFIRMED, so any booking
+  // still awaiting manager confirmation got a hard "Cannot transition booking from PENDING to
+  // RESCHEDULED" 400 on every reschedule attempt. Root cause of "reschedule not working".
+  [BookingStatus.PENDING]:     [BookingStatus.CONFIRMED, BookingStatus.CANCELLED, BookingStatus.RESCHEDULED],
   [BookingStatus.CONFIRMED]:   [BookingStatus.ASSIGNED, BookingStatus.IN_PROGRESS, BookingStatus.CANCELLED, BookingStatus.RESCHEDULED, BookingStatus.NO_SHOW],
   [BookingStatus.ASSIGNED]:    [BookingStatus.IN_PROGRESS, BookingStatus.COMPLETED, BookingStatus.CANCELLED],
   [BookingStatus.IN_PROGRESS]: [BookingStatus.COMPLETED, BookingStatus.CANCELLED],
@@ -439,18 +443,59 @@ export class BookingsService {
     return { success: true, data: booking };
   }
 
-  async getSummary(id: string) {
+  async getSummary(id: string, actor?: { id: string; role: Role }) {
     const booking = await this.prisma.booking.findUnique({
       where: { id },
       include: {
         service:      { select: { id: true, name: true, thumbnail: true } },
         propertyType: { select: { id: true, name: true } },
         package:      { select: { id: true, name: true, description: true, price: true, durationMinutes: true } },
+        pricingOption: { select: { id: true, label: true, price: true } },
+        timeSlot:     { select: { id: true, date: true, startTime: true, endTime: true } },
         address:      true,
         customer:     { select: { id: true, name: true, email: true, phone: true } },
+        // Same source of truth getPaymentConfig() already uses for "amount actually paid":
+        // only SUCCESS payments, summed. For a partial (ADVANCE) payment this correctly
+        // reflects what was actually collected, not booking.advanceAmount (the amount that
+        // was merely due).
+        invoice: {
+          select: {
+            id: true,
+            invoiceNumber: true,
+            status: true,
+            total: true,
+            pdfUrl: true,
+            pdfGeneratedAt: true,
+            payments: {
+              where: { status: PaymentStatus.SUCCESS },
+              select: {
+                amount: true,
+                method: true,
+                paidAt: true,
+                transactions: { select: { razorpayPaymentId: true }, orderBy: { createdAt: 'desc' }, take: 1 },
+              },
+              orderBy: { paidAt: 'desc' },
+            },
+          },
+        },
       },
     });
     if (!booking) throw new NotFoundException('Booking not found');
+    // USER can only view their own booking's summary — ADMIN/MANAGER/WORKER (the endpoint's
+    // other allowed roles) keep unrestricted access, matching every other USER-facing booking
+    // read in this service (see assertOwner call sites elsewhere).
+    if (actor?.role === Role.USER) this.assertOwner(booking, actor.id);
+
+    const totalAmount = r0(booking.totalAmount ?? 0);
+    const paidFromInvoice = booking.invoice
+      ? r2(booking.invoice.payments.reduce((sum, p) => sum + p.amount, 0))
+      : null;
+    // Fallback to Booking.paidAmount only when there's no invoice/payment history to sum —
+    // covers bookings verified through the older simplified verify flow. Never advanceAmount:
+    // that's the amount that was DUE, not what was actually paid.
+    const paidAmount = r0(paidFromInvoice ?? booking.paidAmount ?? 0);
+    const remainingAmount = Math.max(0, totalAmount - paidAmount);
+    const latestPayment = booking.invoice?.payments[0];
 
     return {
       success: true,
@@ -459,16 +504,36 @@ export class BookingsService {
         status: booking.status,
         service: booking.service,
         scheduledAt: booking.scheduledAt,
+        timeSlot: booking.timeSlot,
         customer: booking.customer,
         address: booking.address,
         propertyType: booking.propertyType,
         package: booking.package
           ? { ...booking.package, price: booking.packagePrice ?? booking.package.price }
           : null,
+        pricingOption: booking.pricingOption,
         pricing: {
-          totalAmount: booking.totalAmount,
+          totalAmount,
           advanceAmount: booking.advanceAmount,
+          paidAmount,
+          remainingAmount,
         },
+        payment: {
+          status: booking.paymentStatus,
+          method: latestPayment?.method ?? booking.paymentMethod ?? null,
+          paidAt: latestPayment?.paidAt ?? booking.paidAt ?? null,
+          transactionId: latestPayment?.transactions[0]?.razorpayPaymentId ?? booking.razorpayPaymentId ?? null,
+        },
+        invoice: booking.invoice
+          ? {
+              id: booking.invoice.id,
+              invoiceNumber: booking.invoice.invoiceNumber,
+              status: booking.invoice.status,
+              total: booking.invoice.total,
+              pdfUrl: booking.invoice.pdfUrl,
+              pdfGeneratedAt: booking.invoice.pdfGeneratedAt,
+            }
+          : null,
         notes: booking.notes,
       },
     };
@@ -890,11 +955,18 @@ export class BookingsService {
 
     if (dto.scheduledAt < new Date()) throw new BadRequestException('Rescheduled date must be in the future');
 
-    if (dto.timeSlotId && dto.timeSlotId !== booking.timeSlotId) {
-      await this.validateAndClaimSlot(dto.timeSlotId, booking.serviceId);
-      if (booking.timeSlotId) await this.releaseSlot(booking.timeSlotId);
+    const previousTimeSlotId = booking.timeSlotId;
+    const isSlotChanging = !!dto.timeSlotId && dto.timeSlotId !== booking.timeSlotId;
+    if (isSlotChanging) {
+      // Validates the new slot exists, belongs to this booking's service, is marked available,
+      // and has remaining capacity — throws NotFoundException/BadRequestException otherwise.
+      await this.validateAndClaimSlot(dto.timeSlotId!, booking.serviceId);
     }
 
+    // Move the booking onto the new slot FIRST, then reconcile availability for both slots
+    // afterward. Reconciling the old slot before this update ran (the previous bug) computed
+    // its active-booking count while this booking's timeSlotId still pointed at it, so the old
+    // slot was never actually freed up.
     const updated = await this.prisma.booking.update({
       where: { id },
       data: {
@@ -907,7 +979,16 @@ export class BookingsService {
     });
 
     await this.recordStatusHistory(id, BookingStatus.RESCHEDULED, customerId, dto.reason);
-    this.audit(customerId, id, AuditAction.UPDATE, { scheduledAt: dto.scheduledAt });
+    this.audit(customerId, id, AuditAction.UPDATE, { scheduledAt: dto.scheduledAt, timeSlotId: updated.timeSlotId });
+
+    if (isSlotChanging) {
+      if (previousTimeSlotId) {
+        this.reconcileSlotAvailability(previousTimeSlotId, BookingStatus.CANCELLED)
+          .catch((err: Error) => this.logger.error(`[reschedule] releasing old slot failed (non-fatal, background): ${err.message}`));
+      }
+      this.reconcileSlotAvailability(dto.timeSlotId!, BookingStatus.RESCHEDULED)
+        .catch((err: Error) => this.logger.error(`[reschedule] reserving new slot failed (non-fatal, background): ${err.message}`));
+    }
 
     if (booking.workerId) {
       this.notifications.notify(booking.workerId, 'Booking Rescheduled', `A booking for ${booking.service.name} has been rescheduled to ${dto.scheduledAt.toISOString().slice(0, 10)}.`, { bookingId: id }).catch(() => {});
@@ -1119,9 +1200,25 @@ export class BookingsService {
 
       if (booking.status === BookingStatus.PENDING_PAYMENT) {
         this.logger.debug(`[razorpay-verify] booking update START (+${Date.now() - t0}ms)`);
+        // Root cause of "paid amount / payment method / transaction id missing on the booking
+        // detail screen": this update used to only touch status/paymentStatus — the actual
+        // paidAmount, paidAt, method, and razorpayPaymentId that verifyRazorpay() already
+        // computed and persisted onto the Payment/Transaction rows were never copied onto the
+        // Booking itself, unlike the sibling verifyBookingPayment() flow below which does. Mirror
+        // that here so both verification paths leave the Booking row fully populated.
+        const verifiedPayment = result.data;
         const updated = await this.prisma.booking.update({
           where: { id: bookingId },
-          data: { status: BookingStatus.PENDING, paymentStatus: PaymentStatus.SUCCESS },
+          data: {
+            status: BookingStatus.PENDING,
+            paymentStatus: PaymentStatus.SUCCESS,
+            ...(verifiedPayment && {
+              razorpayPaymentId: verifiedPayment.transactions?.[0]?.razorpayPaymentId ?? dto.razorpayPaymentId,
+              paidAmount: verifiedPayment.paidAmount ?? verifiedPayment.amount,
+              paidAt: verifiedPayment.paidAt ?? new Date(),
+              paymentMethod: PaymentMethod.RAZORPAY,
+            }),
+          },
           include: BOOKING_INCLUDE,
         });
         this.logger.debug(`[razorpay-verify] booking update END (+${Date.now() - t0}ms)`);

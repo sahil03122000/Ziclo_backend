@@ -6,7 +6,15 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { AuditAction, BookingStatus, InvoiceStatus, PaymentMethod, PaymentStatus, PaymentType, Prisma } from '@prisma/client';
+import { ConfigService } from '@nestjs/config';
+import { AuditAction, BookingStatus, InvoiceStatus, PaymentMethod, PaymentStatus, PaymentType, Prisma, Role } from '@prisma/client';
+import { createWriteStream } from 'fs';
+import { mkdir } from 'fs/promises';
+import { join } from 'path';
+// Same PDF library reports.service.ts already uses for generated exports —
+// no new PDF dependency introduced.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const PDFDocument = require('pdfkit');
 
 import { AuditLogsService } from '../../audit-logs/audit-logs.service';
 import { NotificationsService } from '../../notifications/notifications.service';
@@ -65,6 +73,7 @@ export class InvoicesService {
     private readonly prisma: PrismaService,
     private readonly notifications: NotificationsService,
     private readonly auditLogs: AuditLogsService,
+    private readonly configService: ConfigService,
   ) {}
 
   // ─── Create ───────────────────────────────────────────────────────────────────
@@ -570,15 +579,177 @@ export class InvoicesService {
 
   // ─── PDF URL ──────────────────────────────────────────────────────────────────
 
-  async getPdf(id: string) {
+  // No admin ever calls PATCH :id/pdf in practice — pdfUrl was always null,
+  // so every real invoice 404'd here forever. Generates the PDF from the
+  // invoice's own real data (same pdfkit approach reports.service.ts already
+  // uses for exports) on first request and persists pdfUrl/pdfGeneratedAt via
+  // the same columns updatePdfMetadata() writes, so subsequent requests are
+  // instant reads and other admin tooling that already reads those columns
+  // keeps working unchanged.
+  async getPdf(id: string, actor?: { id: string; role: Role }) {
     const invoice = await this.prisma.invoice.findUnique({
       where: { id },
-      select: { id: true, invoiceNumber: true, pdfUrl: true, pdfGeneratedAt: true },
+      select: { id: true, invoiceNumber: true, pdfUrl: true, pdfGeneratedAt: true, customerId: true },
     });
     if (!invoice) throw new NotFoundException('Invoice not found');
-    if (!invoice.pdfUrl) throw new NotFoundException('PDF has not been generated for this invoice yet');
+    if (actor?.role === Role.USER && invoice.customerId !== actor.id) {
+      throw new NotFoundException('Invoice not found');
+    }
 
-    return { success: true, data: { pdfUrl: invoice.pdfUrl, generatedAt: invoice.pdfGeneratedAt } };
+    if (invoice.pdfUrl) {
+      return {
+        success: true,
+        data: { invoiceNumber: invoice.invoiceNumber, pdfUrl: invoice.pdfUrl, generatedAt: invoice.pdfGeneratedAt },
+      };
+    }
+
+    const baseUrl = this.configService.get<string>('baseUrl');
+    if (!baseUrl) {
+      this.logger.warn('BASE_URL is not configured — cannot generate a public invoice PDF URL. Set BASE_URL=http://<lan-ip>:3000 in .env');
+      throw new InternalServerErrorException('Invoice PDF cannot be generated right now. Please try again later.');
+    }
+
+    // Own narrow `select` (not INVOICE_INCLUDE) — precisely typed for exactly
+    // what the PDF needs, side-stepping INVOICE_INCLUDE's widened `: Prisma.
+    // InvoiceInclude` annotation losing its nested `booking.select.service`
+    // shape.
+    const full = await this.prisma.invoice.findUnique({
+      where: { id },
+      select: {
+        invoiceNumber: true,
+        createdAt: true,
+        subtotal: true,
+        discountAmount: true,
+        cgst: true,
+        sgst: true,
+        igst: true,
+        isInterState: true,
+        total: true,
+        customer: { select: { name: true, email: true, phone: true } },
+        booking: { select: { scheduledAt: true, service: { select: { name: true } } } },
+        items: { select: { description: true, quantity: true, unitPrice: true, amount: true }, orderBy: { createdAt: 'asc' } },
+      },
+    });
+    if (!full) throw new NotFoundException('Invoice not found');
+
+    const fileName = `invoice-${full.invoiceNumber}.pdf`;
+    const dir = join(process.cwd(), 'exports', 'invoices');
+    const filepath = join(dir, fileName);
+    try {
+      await mkdir(dir, { recursive: true });
+      await this.generateInvoicePdfFile(full, filepath);
+    } catch (err) {
+      this.logger.error('[InvoicesService] PDF generation failed:', err as Error);
+      throw new InternalServerErrorException('Unable to generate invoice PDF.');
+    }
+
+    const pdfUrl = `${baseUrl}/exports/invoices/${fileName}`;
+    const generatedAt = new Date();
+    const updated = await this.prisma.invoice.update({
+      where: { id },
+      data: { pdfUrl, pdfGeneratedAt: generatedAt },
+      select: { invoiceNumber: true, pdfUrl: true, pdfGeneratedAt: true },
+    });
+
+    return {
+      success: true,
+      data: { invoiceNumber: updated.invoiceNumber, pdfUrl: updated.pdfUrl, generatedAt: updated.pdfGeneratedAt },
+    };
+  }
+
+  // Real invoice data only — customer, booking/service, line items, and the
+  // same subtotal/discount/tax/total columns findOne()/the frontend already
+  // read. No placeholder text, no fabricated line items.
+  //
+  // Typed by hand (not Prisma.InvoiceGetPayload<{include: typeof
+  // INVOICE_INCLUDE}>) — INVOICE_INCLUDE is declared `: Prisma.InvoiceInclude`,
+  // which widens its `typeof` back to the general interface and loses the
+  // nested `booking.select.service` shape GetPayload needs to type it.
+  private async generateInvoicePdfFile(
+    invoice: {
+      invoiceNumber: string;
+      createdAt: Date;
+      subtotal: number;
+      discountAmount: number;
+      cgst: number;
+      sgst: number;
+      igst: number;
+      isInterState: boolean;
+      total: number;
+      customer: { name: string; email: string; phone: string } | null;
+      booking: { scheduledAt: Date; service: { name: string } } | null;
+      items: { description: string; quantity: number; unitPrice: number; amount: number }[];
+    },
+    filepath: string,
+  ): Promise<void> {
+    const doc = new PDFDocument({ margin: 40, size: 'A4' });
+    const stream = createWriteStream(filepath);
+    doc.pipe(stream);
+
+    doc.rect(0, 0, doc.page.width, 70).fill('#1F4E79');
+    doc.fill('white').fontSize(18).font('Helvetica-Bold').text('Ziclo — Tax Invoice', 40, 22, { lineBreak: false });
+    doc.fontSize(10).font('Helvetica').text(`Invoice No: ${invoice.invoiceNumber}`, 40, 46, { lineBreak: false });
+    doc.fill('#000000');
+
+    doc.moveDown(3);
+    doc.fontSize(10).font('Helvetica-Bold').text('Billed To');
+    doc.font('Helvetica').text(invoice.customer?.name ?? '—');
+    if (invoice.customer?.email) doc.text(invoice.customer.email);
+    if (invoice.customer?.phone) doc.text(invoice.customer.phone);
+
+    doc.moveDown();
+    doc.font('Helvetica-Bold').text('Invoice Date: ', { continued: true }).font('Helvetica').text(invoice.createdAt.toLocaleDateString('en-IN'));
+    if (invoice.booking?.service?.name) {
+      doc.font('Helvetica-Bold').text('Service: ', { continued: true }).font('Helvetica').text(invoice.booking.service.name);
+    }
+    if (invoice.booking?.scheduledAt) {
+      doc.font('Helvetica-Bold').text('Scheduled: ', { continued: true }).font('Helvetica').text(new Date(invoice.booking.scheduledAt).toLocaleDateString('en-IN'));
+    }
+
+    doc.moveDown(1.5);
+    const tableTop = doc.y;
+    const colX = { desc: 40, qty: 300, price: 360, amount: 450 };
+    doc.font('Helvetica-Bold').fontSize(10);
+    doc.text('Description', colX.desc, tableTop);
+    doc.text('Qty', colX.qty, tableTop);
+    doc.text('Unit Price', colX.price, tableTop);
+    doc.text('Amount', colX.amount, tableTop);
+    doc.moveTo(40, tableTop + 16).lineTo(555, tableTop + 16).stroke();
+
+    let y = tableTop + 24;
+    doc.font('Helvetica').fontSize(10);
+    for (const item of invoice.items) {
+      doc.text(item.description, colX.desc, y, { width: 250 });
+      doc.text(String(item.quantity), colX.qty, y);
+      doc.text(`Rs. ${item.unitPrice.toFixed(2)}`, colX.price, y);
+      doc.text(`Rs. ${item.amount.toFixed(2)}`, colX.amount, y);
+      y += 20;
+    }
+
+    y += 10;
+    doc.moveTo(340, y).lineTo(555, y).stroke();
+    y += 10;
+    const totalsRow = (label: string, value: number) => {
+      doc.font('Helvetica').text(label, 340, y);
+      doc.text(`Rs. ${value.toFixed(2)}`, colX.amount, y);
+      y += 18;
+    };
+    totalsRow('Subtotal', invoice.subtotal);
+    if (invoice.discountAmount) totalsRow('Discount', -invoice.discountAmount);
+    if (invoice.isInterState) {
+      totalsRow('IGST', invoice.igst);
+    } else {
+      totalsRow('CGST', invoice.cgst);
+      totalsRow('SGST', invoice.sgst);
+    }
+    doc.font('Helvetica-Bold').fontSize(12).text('Total', 340, y);
+    doc.text(`Rs. ${invoice.total.toFixed(2)}`, colX.amount, y);
+
+    doc.end();
+    await new Promise<void>((resolve, reject) => {
+      stream.on('finish', () => resolve());
+      stream.on('error', reject);
+    });
   }
 
   // ─── Internal — called by PaymentsService ─────────────────────────────────────
