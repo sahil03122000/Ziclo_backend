@@ -102,9 +102,12 @@ export class AttendanceService {
       );
     }
 
-    // Additive — only for MANAGER (WORKER check-in behavior is unchanged for backward
-    // compatibility). Confirms the office/area are the manager's own assignment and, if a
-    // shift is assigned, that check-in falls within it.
+    // Shift-window enforcement — WORKER and MANAGER alike. No-op when the user has no assigned
+    // shift (unchanged default behavior for anyone without one configured).
+    await this.assertCheckInWithinShift(userId, new Date());
+
+    // Additive — only for MANAGER (WORKER check-in behavior is otherwise unchanged for
+    // backward compatibility). Confirms the office/area are the manager's own assignment.
     if (actor?.role === Role.MANAGER) {
       await this.validateManagerCheckInAssignment(
         userId,
@@ -304,7 +307,22 @@ export class AttendanceService {
       // Multi-session days are allowed — always resolve to the most recent session today.
       orderBy: { checkInTime: 'desc' },
     });
-    return { success: true, data: attendance ?? null };
+
+    // Additive top-level field — `data` keeps its existing attendance-or-null shape unchanged.
+    // Lets the check-in screen show shift start/end and whether check-in is currently allowed
+    // (and why not, if blocked) without a separate request or duplicating the same window logic
+    // checkIn() enforces — same evaluateShiftWindow/resolveUserShift used by both.
+    const shift = await this.resolveUserShift(userId);
+    const shiftWindow = this.evaluateShiftWindow(shift, new Date());
+    const shiftStatus = {
+      shiftAssigned: !!shift,
+      shiftStart: shiftWindow.shiftStart,
+      shiftEnd: shiftWindow.shiftEnd,
+      checkInAllowed: shiftWindow.allowed,
+      reason: shiftWindow.reason,
+    };
+
+    return { success: true, data: attendance ?? null, shiftStatus };
   }
 
   // Worker Panel "Home" / "Attendance" screens — all of today's sessions grouped together
@@ -785,6 +803,68 @@ export class AttendanceService {
     return AttendanceStatus.ABSENT;
   }
 
+  // Role-agnostic shift-window evaluation, shared by both the WORKER/MANAGER check-in gate
+  // (checkIn) and the read-only status the frontend polls before attempting check-in
+  // (getTodayAttendance). Pure function of (shift, now) — no I/O — so both call sites always
+  // agree on exactly the same allowed/blocked decision and message. `shift` is null when the
+  // user has no assigned shift yet, in which case check-in is always allowed (unchanged
+  // pre-existing default behavior for anyone without a shift configured).
+  private evaluateShiftWindow(
+    shift: {
+      startTime: string;
+      endTime: string;
+      graceMinutes: number;
+      workingDays: number[];
+    } | null,
+    at: Date,
+  ): {
+    allowed: boolean;
+    reason: string | null;
+    shiftStart: string | null;
+    shiftEnd: string | null;
+  } {
+    if (!shift) {
+      return { allowed: true, reason: null, shiftStart: null, shiftEnd: null };
+    }
+
+    const dayOfWeek = at.getDay(); // 0 = Sunday .. 6 = Saturday
+    if (shift.workingDays.length > 0 && !shift.workingDays.includes(dayOfWeek)) {
+      return {
+        allowed: false,
+        reason: 'Today is not a working day for your assigned shift.',
+        shiftStart: shift.startTime,
+        shiftEnd: shift.endTime,
+      };
+    }
+
+    const minutesSinceMidnight = at.getHours() * 60 + at.getMinutes();
+    const [startH, startM] = shift.startTime.split(':').map(Number);
+    const [endH, endM] = shift.endTime.split(':').map(Number);
+    // Grace period only widens the check-in window at the START (early arrival tolerance,
+    // pre-existing behavior) — the message below always states the actual configured shift
+    // start, not the grace-adjusted one, per the required wording.
+    const windowStart = startH * 60 + startM - shift.graceMinutes;
+    const windowEnd = endH * 60 + endM;
+
+    if (minutesSinceMidnight < windowStart) {
+      return {
+        allowed: false,
+        reason: `Your shift has not started yet. Your shift starts at ${shift.startTime}.`,
+        shiftStart: shift.startTime,
+        shiftEnd: shift.endTime,
+      };
+    }
+    if (minutesSinceMidnight > windowEnd) {
+      return {
+        allowed: false,
+        reason: `Your shift has ended. Your shift ended at ${shift.endTime}.`,
+        shiftStart: shift.startTime,
+        shiftEnd: shift.endTime,
+      };
+    }
+    return { allowed: true, reason: null, shiftStart: shift.startTime, shiftEnd: shift.endTime };
+  }
+
   // Worker or manager — whichever profile the user actually has. Returns null when no shift
   // is assigned, so callers fall back to their existing default behavior.
   async resolveUserShift(userId: string) {
@@ -880,32 +960,18 @@ export class AttendanceService {
       );
     }
 
-    const shift = profile.shiftRef;
-    if (shift) {
-      const dayOfWeek = checkInTime.getDay(); // 0 = Sunday .. 6 = Saturday
-      if (
-        shift.workingDays.length > 0 &&
-        !shift.workingDays.includes(dayOfWeek)
-      ) {
-        throw new BadRequestException(
-          'Today is not a working day for your assigned shift',
-        );
-      }
+    // Shift-window enforcement itself now lives in evaluateShiftWindow/assertCheckInWithinShift,
+    // called once from checkIn() for both WORKER and MANAGER — not duplicated here.
+  }
 
-      const minutesSinceMidnight =
-        checkInTime.getHours() * 60 + checkInTime.getMinutes();
-      const [startH, startM] = shift.startTime.split(':').map(Number);
-      const [endH, endM] = shift.endTime.split(':').map(Number);
-      const windowStart = startH * 60 + startM - shift.graceMinutes;
-      const windowEnd = endH * 60 + endM;
-      if (
-        minutesSinceMidnight < windowStart ||
-        minutesSinceMidnight > windowEnd
-      ) {
-        throw new BadRequestException(
-          'Check-in is outside your assigned shift hours',
-        );
-      }
+  // Role-agnostic check-in gate: resolves the caller's assigned shift and throws with the
+  // required before-start / after-end message if check-in falls outside it. No-op when the
+  // user has no assigned shift (unchanged default behavior).
+  private async assertCheckInWithinShift(userId: string, at: Date): Promise<void> {
+    const shift = await this.resolveUserShift(userId);
+    const result = this.evaluateShiftWindow(shift, at);
+    if (!result.allowed) {
+      throw new BadRequestException(result.reason!);
     }
   }
 }

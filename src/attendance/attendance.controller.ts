@@ -48,12 +48,15 @@ export class AttendanceController {
       'Records a check-in for the day. GPS coordinates are validated against the assigned office location geofence. ' +
       'Selfie URL should be from a prior `POST /uploads` call. ' +
       'Only one check-in allowed per day — returns an error if already checked in. ' +
-      'For MANAGER callers only (WORKER behavior is unchanged): officeLocationId must be one ' +
-      "of the manager's own assigned offices, its area must be one of the manager's own " +
-      'assigned areas, and — if a shift is assigned — check-in must fall on a working day ' +
-      'within the shift window (+ grace period at the start). Each check is skipped if the ' +
-      "manager has no such assignment configured yet, so an incomplete profile doesn't lock " +
-      'them out entirely.',
+      'For WORKER and MANAGER alike: if the caller has an assigned Shift, check-in is only ' +
+      'allowed on a working day within the shift window (start time minus grace period, through ' +
+      'end time) — before start returns "Your shift has not started yet. Your shift starts at ' +
+      'HH:MM.", after end returns "Your shift has ended. Your shift ended at HH:MM." Skipped ' +
+      'entirely for a caller with no shift assigned (unchanged default behavior). ' +
+      'For MANAGER callers only (WORKER behavior is otherwise unchanged): officeLocationId must ' +
+      "be one of the manager's own assigned offices, and its area must be one of the manager's " +
+      'own assigned areas. Each check is skipped if the manager has no such assignment ' +
+      "configured yet, so an incomplete profile doesn't lock them out entirely.",
   })
   @ApiResponse({
     status: 201,
@@ -87,7 +90,7 @@ export class AttendanceController {
   @ApiResponse({
     status: 400,
     description:
-      'Already checked in today, outside geofence radius, not a working day, or outside shift hours',
+      'Already checked in today, outside geofence radius, not a working day, before shift start, or after shift end',
   })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   @ApiResponse({
@@ -144,7 +147,11 @@ export class AttendanceController {
   })
   @ApiResponse({
     status: 200,
-    description: "Today's attendance or null if no check-in yet",
+    description:
+      "Today's attendance (or null if no check-in yet) plus shiftStatus — the caller's " +
+      'assigned shift start/end, whether check-in is currently allowed, and the reason when ' +
+      "it isn't (same rules POST checkin enforces), so the check-in screen can show this " +
+      'without attempting a check-in first.',
     schema: {
       example: {
         success: true,
@@ -153,6 +160,13 @@ export class AttendanceController {
           status: 'CHECKED_IN',
           checkInTime: '2026-06-21T09:00:00Z',
           checkOutTime: null,
+        },
+        shiftStatus: {
+          shiftAssigned: true,
+          shiftStart: '09:00',
+          shiftEnd: '18:00',
+          checkInAllowed: true,
+          reason: null,
         },
       },
     },
