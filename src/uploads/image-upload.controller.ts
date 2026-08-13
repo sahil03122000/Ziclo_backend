@@ -80,11 +80,21 @@ export class ImageUploadController {
 
     this.logger.log(`Image uploaded to Cloudinary: ${file.filename} (${file.path})`);
 
+    // Root cause of "Upload succeeded but no image URL was returned" (Manager/Worker Aadhaar
+    // upload, which calls this same endpoint with type=manager|worker): every other endpoint in
+    // this API returns {success, data: {...}} — ResponseInterceptor only wraps bare values, and
+    // passes an object through unchanged once it already has a top-level `success` key (see
+    // src/common/interceptors/response.interceptor.ts). This handler returned `url` at the top
+    // level instead of inside `data`, so callers reading the standard `response.data.data.url`
+    // shape (every other upload/mutation endpoint) got undefined. Nesting under `data` here
+    // matches that contract; `url` remains the field name.
     return {
       success: true,
-      url: file.path,
-      filename: file.filename,
-      path: file.path,
+      data: {
+        url: file.path,
+        filename: file.filename,
+        path: file.path,
+      },
     };
   }
 

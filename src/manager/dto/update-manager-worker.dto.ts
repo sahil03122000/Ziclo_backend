@@ -20,6 +20,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 
+import { IsAdult } from '../../common/validators/is-adult.validator';
 import { WorkerBankDetailsDto } from './worker-bank-details.dto';
 import { WorkerCommissionInputDto } from './worker-commission-input.dto';
 
@@ -72,10 +73,11 @@ export class UpdateManagerWorkerDto {
 
   @ApiPropertyOptional({
     example: '1995-06-15',
-    description: 'ISO date string',
+    description: 'ISO date string. Must not be in the future; worker must be at least 18 years old.',
   })
   @IsOptional()
   @IsDateString()
+  @IsAdult()
   dateOfBirth?: string;
 
   @ApiPropertyOptional({

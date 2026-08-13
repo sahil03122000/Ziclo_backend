@@ -21,6 +21,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 
+import { IsAdult } from '../../common/validators/is-adult.validator';
 import { ManagerBankDetailsDto } from './manager-bank-details.dto';
 
 const AADHAAR_REGEX = /^\d{12}$/;
@@ -130,10 +131,11 @@ export class UpdateManagerDto {
 
   @ApiPropertyOptional({
     example: '1985-04-20',
-    description: 'ISO date string',
+    description: 'ISO date string. Must not be in the future; manager must be at least 18 years old.',
   })
   @IsOptional()
   @IsDateString()
+  @IsAdult()
   dateOfBirth?: string;
 
   @ApiPropertyOptional({
