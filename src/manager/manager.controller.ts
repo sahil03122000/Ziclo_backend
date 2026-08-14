@@ -16,6 +16,7 @@ import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RoleGuard } from '../common/guards/role.guard';
 import { AuthUser } from '../common/types/auth-user.type';
 import { ApplyLeaveDto } from '../leave-request/dto/apply-leave.dto';
+import { LeaveStatusQueryDto } from '../leave-request/dto/leave-status-query.dto';
 import { LeaveRequestService } from '../leave-request/leave-request.service';
 import { ManagerAreaQueryDto } from './dto/manager-area-query.dto';
 import { ManagerService } from './manager.service';
@@ -47,11 +48,14 @@ export class ManagerController {
   }
 
   @Get('leaves')
-  @ApiOperation({ summary: "Logged-in manager's own leave request history — MANAGER" })
+  @ApiOperation({
+    summary: "Logged-in manager's own leave request history — MANAGER",
+    description: 'Optionally filter by ?status=PENDING|APPROVED|REJECTED|CANCELLED. Omit to return the full history.',
+  })
   @ApiResponse({ status: 200, description: 'Leave request list' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
-  getMyLeaves(@CurrentUser() user: AuthUser) {
-    return this.leaveRequestService.getMyLeaves(user.id);
+  getMyLeaves(@CurrentUser() user: AuthUser, @Query() query: LeaveStatusQueryDto) {
+    return this.leaveRequestService.getMyLeaves(user.id, query.status);
   }
 
   @Delete('leaves/:id')

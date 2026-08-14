@@ -66,11 +66,7 @@ export class LeaveRequestService {
   // ─── Worker ───────────────────────────────────────────────────────────────────
 
   async applyLeave(userId: string, dto: ApplyLeaveDto) {
-    const existing = await this.prisma.workerLeaveRequest.findFirst({
-      where: { workerId: userId, date: new Date(dto.date), status: LeaveRequestStatus.PENDING },
-      select: { id: true },
-    });
-    if (existing) throw new BadRequestException('A pending leave request already exists for this date');
+    await this.assertApplicable(userId, dto);
 
     const workerProfile = await this.prisma.workerProfile.findUnique({
       where: { userId },
@@ -104,9 +100,9 @@ export class LeaveRequestService {
     return { success: true, message: 'Leave request submitted', data: this.toLeaveDto(leave) };
   }
 
-  async getMyLeaves(userId: string) {
+  async getMyLeaves(userId: string, status?: LeaveRequestStatus) {
     const leaves = await this.prisma.workerLeaveRequest.findMany({
-      where: { workerId: userId },
+      where: { workerId: userId, ...(status ? { status } : {}) },
       orderBy: { appliedAt: 'desc' },
     });
     return { success: true, data: leaves.map((l) => this.toLeaveDto(l)) };
@@ -137,11 +133,7 @@ export class LeaveRequestService {
   // through the existing, unmodified adminList/adminApprove/adminReject endpoints.
 
   async applyManagerLeave(userId: string, dto: ApplyLeaveDto) {
-    const existing = await this.prisma.workerLeaveRequest.findFirst({
-      where: { workerId: userId, date: new Date(dto.date), status: LeaveRequestStatus.PENDING },
-      select: { id: true },
-    });
-    if (existing) throw new BadRequestException('A pending leave request already exists for this date');
+    await this.assertApplicable(userId, dto);
 
     const leave = await this.prisma.workerLeaveRequest.create({
       data: {
@@ -225,11 +217,15 @@ export class LeaveRequestService {
 
   // ─── Admin ────────────────────────────────────────────────────────────────────
 
+  // Defaults to the live pending-approval queue (unchanged from before) when no status is
+  // given, but — unlike before — now actually honors an explicit ?status=, the same way
+  // managerList already does. Previously this hardcoded status: PENDING unconditionally, so an
+  // admin had no way to ever see APPROVED/REJECTED/CANCELLED history — only the current queue.
   async adminList(query: QueryLeaveRequestsDto) {
     return this.listRequests(
       {
         currentLevel: LeaveApprovalLevel.ADMIN,
-        status: LeaveRequestStatus.PENDING,
+        status: query.status ?? LeaveRequestStatus.PENDING,
       },
       query,
     );
@@ -424,6 +420,41 @@ export class LeaveRequestService {
       actor: { id: actor.id, name: actor.name, role: actor.role },
       target: { id: requestId, type: 'WorkerLeaveRequest' },
     });
+  }
+
+  // Shared by applyLeave (worker) and applyManagerLeave (manager) — same validation either way,
+  // since both apply onto the same WorkerLeaveRequest table. Rejects a past date and blocks a
+  // second request landing on a date that already has a PENDING or APPROVED one (prevents
+  // double-applying/overlap for the same day) — neither check existed before. Deliberately does
+  // NOT reject for insufficient balance: that's an intentional existing design choice (see
+  // deductForApprovedLeave's own comment) — an over-budget request still gets created and is
+  // decided normally, any shortfall just settles as Leave Without Pay at approval time, exactly
+  // as it already does today. Preserved, not changed.
+  private async assertApplicable(userId: string, dto: ApplyLeaveDto): Promise<void> {
+    const requestedDate = new Date(dto.date);
+    if (isNaN(requestedDate.getTime())) throw new BadRequestException('Invalid date');
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (requestedDate < today) {
+      throw new BadRequestException('Cannot apply for leave on a past date');
+    }
+
+    const existing = await this.prisma.workerLeaveRequest.findFirst({
+      where: {
+        workerId: userId,
+        date: requestedDate,
+        status: { in: [LeaveRequestStatus.PENDING, LeaveRequestStatus.APPROVED] },
+      },
+      select: { id: true, status: true },
+    });
+    if (existing) {
+      throw new BadRequestException(
+        existing.status === LeaveRequestStatus.APPROVED
+          ? 'An approved leave request already exists for this date'
+          : 'A pending leave request already exists for this date',
+      );
+    }
   }
 
   // Same "worker's manager" resolution AttendanceService.resolveManagerUserId /

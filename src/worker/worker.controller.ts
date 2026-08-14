@@ -8,6 +8,7 @@ import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RoleGuard } from '../common/guards/role.guard';
 import type { AuthUser } from '../common/types/auth-user.type';
 import { ApplyLeaveDto } from '../leave-request/dto/apply-leave.dto';
+import { LeaveStatusQueryDto } from '../leave-request/dto/leave-status-query.dto';
 import { LeaveRequestService } from '../leave-request/leave-request.service';
 import { QueryAttendanceHistoryDto } from './dto/query-attendance-history.dto';
 import { WorkerService } from './worker.service';
@@ -76,10 +77,13 @@ export class WorkerController {
   }
 
   @Get('leaves')
-  @ApiOperation({ summary: "Logged-in worker's leave request history — WORKER (Worker Panel: Leave Request)" })
+  @ApiOperation({
+    summary: "Logged-in worker's leave request history — WORKER (Worker Panel: Leave Request)",
+    description: 'Optionally filter by ?status=PENDING|APPROVED|REJECTED|CANCELLED. Omit to return the full history.',
+  })
   @ApiResponse({ status: 200, description: 'Leave request list' })
-  getMyLeaves(@CurrentUser() user: AuthUser) {
-    return this.leaveRequestService.getMyLeaves(user.id);
+  getMyLeaves(@CurrentUser() user: AuthUser, @Query() query: LeaveStatusQueryDto) {
+    return this.leaveRequestService.getMyLeaves(user.id, query.status);
   }
 
   @Delete('leaves/:id')

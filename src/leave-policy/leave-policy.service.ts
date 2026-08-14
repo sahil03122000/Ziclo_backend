@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
-import { LeaveTransactionType, LeaveType, Prisma, Role } from '@prisma/client';
+import { LeaveRequestStatus, LeaveTransactionType, LeaveType, Prisma, Role } from '@prisma/client';
 
 import { PrismaService } from '../prisma/prisma.service';
 import { QueryLeaveTransactionsDto } from './dto/query-leave-transactions.dto';
@@ -143,7 +143,21 @@ export class LeavePolicyService {
   // surfaces the real configured number end-to-end (Admin → DB → Manager/Worker) regardless of
   // where a given employee's accrual cycle currently stands.
   async getBalance(userId: string) {
-    const [balance, policy] = await Promise.all([this.ensureBalanceRow(userId), this.getPolicy()]);
+    const [balance, policy, pendingCounts] = await Promise.all([
+      this.ensureBalanceRow(userId),
+      this.getPolicy(),
+      // Pending count per type — informational only, never subtracted from `remaining`. This
+      // system reserves nothing at apply time (deduction happens once, only at final approval —
+      // see finalizeApproval) — a pending request must not make an otherwise-available balance
+      // look unavailable.
+      this.prisma.workerLeaveRequest.groupBy({
+        by: ['type'],
+        where: { workerId: userId, status: LeaveRequestStatus.PENDING, type: { in: ['CASUAL', 'SICK', 'PLANNED'] } },
+        _count: { _all: true },
+      }),
+    ]);
+    const pendingByType = new Map(pendingCounts.map((p) => [p.type, p._count._all]));
+
     const ENTITLED_FIELD: Record<PolicyGovernedType, keyof LeavePolicyData> = {
       CASUAL: 'casualMonthlyAllocation',
       SICK: 'sickYearlyAllocation',
@@ -157,6 +171,7 @@ export class LeavePolicyService {
         entitled: policy.data[ENTITLED_FIELD[type]] as number,
         available: allocated,
         used,
+        pending: pendingByType.get(type) ?? 0,
         remaining: allocated - used,
       };
     };
@@ -175,10 +190,31 @@ export class LeavePolicyService {
     };
   }
 
+  // Root cause of "Worker Available Sick Leave shows 0 even though Admin configured a real
+  // entitlement": without this, a freshly-created LeaveBalance row starts at 0 for every type
+  // and only grows via the scheduled accrual jobs — Casual/Planned self-heal within the same
+  // month (LeavePolicyCronService.onApplicationBootstrap + the monthly cron), but Sick is only
+  // ever credited once a year at the financial-year reset, so a newly onboarded employee could
+  // show sick=0 for up to a full year even with a valid non-zero policy. Granting the current
+  // policy entitlement once, immediately, on first balance-row creation closes that gap for
+  // every type without altering the ongoing monthly/FY-reset mechanics (carry-forward, reset,
+  // yearly re-grant), which continue to run exactly as before in every subsequent cycle.
   async ensureBalanceRow(userId: string) {
     const existing = await this.prisma.leaveBalance.findUnique({ where: { userId } });
     if (existing) return existing;
-    return this.prisma.leaveBalance.create({ data: { userId } });
+
+    await this.prisma.leaveBalance.create({ data: { userId } });
+    const policy = (await this.getPolicy()).data;
+    if (policy.casualEnabled && policy.casualMonthlyAllocation > 0) {
+      await this.credit(userId, 'CASUAL', policy.casualMonthlyAllocation, LeaveTransactionType.ALLOCATION, 'Initial grant on onboarding');
+    }
+    if (policy.sickEnabled && policy.sickYearlyAllocation > 0) {
+      await this.credit(userId, 'SICK', policy.sickYearlyAllocation, LeaveTransactionType.ALLOCATION, 'Initial grant on onboarding');
+    }
+    if (policy.plannedEnabled && policy.plannedMonthlyAllocation > 0) {
+      await this.credit(userId, 'PLANNED', policy.plannedMonthlyAllocation, LeaveTransactionType.ALLOCATION, 'Initial grant on onboarding');
+    }
+    return this.prisma.leaveBalance.findUniqueOrThrow({ where: { userId } });
   }
 
   // ─── Transactions ───────────────────────────────────────────────────────────────
@@ -359,6 +395,43 @@ export class LeavePolicyService {
       success: true,
       message: `Financial year reset applied for ${thisRunYear}`,
       data: { employeesAffected: balances.length },
+    };
+  }
+
+  // ─── Sick Leave initial-grant backfill ─────────────────────────────────────────
+  // Covers employees whose LeaveBalance row already existed *before* ensureBalanceRow()'s
+  // initial grant was added — the new-hire path above only helps employees onboarded from now
+  // on. Any active WORKER/MANAGER whose sickAllocated is still exactly 0 has never received a
+  // Sick credit at all (a genuinely fully-used balance has sickAllocated > 0 with used caught
+  // up to it, never 0), so crediting them the current sickYearlyAllocation once is a correction,
+  // not a guess — same idempotent `credit()` helper every other allocation path uses, safe to
+  // call repeatedly (a user only ever matches this filter once, the first time it runs for them).
+  async backfillMissingSickGrant(): Promise<{ success: boolean; message: string; data: { employeesAffected: number } }> {
+    const policy = await this.getOrCreatePolicyRow();
+    if (!policy.sickEnabled || policy.sickYearlyAllocation <= 0) {
+      return { success: true, message: 'Sick leave is disabled or has no allocation configured', data: { employeesAffected: 0 } };
+    }
+
+    const employees = await this.prisma.user.findMany({
+      where: {
+        isActive: true,
+        role: { in: [Role.WORKER, Role.MANAGER] },
+        leaveBalance: { sickAllocated: 0 },
+      },
+      select: { id: true },
+    });
+
+    for (const employee of employees) {
+      await this.credit(employee.id, 'SICK', policy.sickYearlyAllocation, LeaveTransactionType.ALLOCATION, 'Initial grant backfill');
+    }
+
+    if (employees.length > 0) {
+      this.logger.log(`Sick leave initial-grant backfill — ${employees.length} employee(s)`);
+    }
+    return {
+      success: true,
+      message: `Sick leave initial-grant backfill applied to ${employees.length} employee(s)`,
+      data: { employeesAffected: employees.length },
     };
   }
 

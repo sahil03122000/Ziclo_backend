@@ -35,6 +35,12 @@ export class LeavePolicyCronService implements OnApplicationBootstrap {
     } catch (err) {
       this.logger.error(`[startup catch-up] financial year reset failed: ${(err as Error).message}`, (err as Error).stack);
     }
+    try {
+      const backfillResult = await this.leavePolicyService.backfillMissingSickGrant();
+      this.logger.log(`[startup catch-up] ${backfillResult.message}`);
+    } catch (err) {
+      this.logger.error(`[startup catch-up] sick leave backfill failed: ${(err as Error).message}`, (err as Error).stack);
+    }
   }
 
   @Cron('0 0 1 * *') // 1st of every month, 00:00
