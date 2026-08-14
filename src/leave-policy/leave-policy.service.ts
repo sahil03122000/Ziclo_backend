@@ -124,16 +124,41 @@ export class LeavePolicyService {
   }
 
   // ─── Balance ────────────────────────────────────────────────────────────────────
-  // Available / Used / Remaining per type, plus Leave Without Pay Used — computed here so
-  // no consumer (including the UI) ever has to derive "remaining" itself.
-
+  // Entitled / Available / Used / Remaining per type, plus Leave Without Pay Used — computed
+  // here so no consumer (including the UI) ever has to derive "remaining" itself. Shared by
+  // both Worker (GET workers/me/dashboard) and Manager (GET managers/me/dashboard) — one
+  // implementation, so a fix here is a fix for both, never a second leave system.
+  //
+  // `entitled` vs `available` — these are deliberately different numbers, not a naming
+  // duplicate: `entitled` is the Admin-configured target straight from LeavePolicy
+  // (casualMonthlyAllocation / sickYearlyAllocation / plannedMonthlyAllocation) — what the
+  // employee is *entitled to*. `available` (unchanged) is what has actually been *credited*
+  // onto LeaveBalance so far via the allocation/FY-reset cron jobs, which is the real spendable
+  // pool `remaining` is computed from — never touched or redefined here. For Casual/Planned
+  // (monthly accrual) these track closely once a few cycles have run. For Sick (a single
+  // once-a-year grant at the financial-year reset — see runFinancialYearReset) `available`
+  // legitimately stays 0 for an employee whose FY reset hasn't fired yet this cycle, even
+  // though Admin has configured a real non-zero entitlement — that was previously invisible to
+  // Manager/Worker (they only ever saw the 0), which is the root cause `entitled` fixes: it
+  // surfaces the real configured number end-to-end (Admin → DB → Manager/Worker) regardless of
+  // where a given employee's accrual cycle currently stands.
   async getBalance(userId: string) {
-    const balance = await this.ensureBalanceRow(userId);
+    const [balance, policy] = await Promise.all([this.ensureBalanceRow(userId), this.getPolicy()]);
+    const ENTITLED_FIELD: Record<PolicyGovernedType, keyof LeavePolicyData> = {
+      CASUAL: 'casualMonthlyAllocation',
+      SICK: 'sickYearlyAllocation',
+      PLANNED: 'plannedMonthlyAllocation',
+    };
     const shape = (type: PolicyGovernedType) => {
       const fields = BALANCE_FIELDS[type];
       const allocated = (balance as unknown as BalanceRow)[fields.allocated];
       const used = (balance as unknown as BalanceRow)[fields.used];
-      return { available: allocated, used, remaining: allocated - used };
+      return {
+        entitled: policy.data[ENTITLED_FIELD[type]] as number,
+        available: allocated,
+        used,
+        remaining: allocated - used,
+      };
     };
 
     return {
@@ -142,9 +167,9 @@ export class LeavePolicyService {
         casual: shape('CASUAL'),
         sick: shape('SICK'),
         planned: shape('PLANNED'),
-        // LWP has no allocated pool to be "remaining" against — it's whatever is left once all
-        // paid leave is exhausted, so `remaining` mirrors `used` (both are the same running
-        // unpaid-days total) rather than implying a cap that doesn't exist.
+        // LWP has no entitled/allocated pool — it's whatever is left once all paid leave is
+        // exhausted, so `remaining` mirrors `used` (both are the same running unpaid-days
+        // total) rather than implying a cap that doesn't exist.
         leaveWithoutPay: { used: balance.lwpUsed, remaining: balance.lwpUsed },
       },
     };
