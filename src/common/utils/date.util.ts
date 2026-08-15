@@ -57,6 +57,17 @@ export function toDateOnlyString(date: Date | null | undefined): string | null {
   return date.toISOString().slice(0, 10);
 }
 
+// Adds `days` (may be negative) to a 'YYYY-MM-DD' string, entirely in UTC —
+// no local-timezone drift, since the input/output are date-only strings, not
+// wall-clock times. Used for gap-filling day-by-day iteration (e.g. the
+// leave calendar's "no attendance row" → ABSENT synthesis) where an
+// off-by-one from timezone conversion would silently shift the wrong day.
+export function addDaysToDateString(dateStr: string, days: number): string {
+  const d = new Date(`${dateStr}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
 export type ReportPeriod = 'today' | 'week' | 'month';
 
 // Resolves a report date filter. Explicit startDate/endDate always win over `period`. `week`

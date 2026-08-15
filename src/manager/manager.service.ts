@@ -32,6 +32,7 @@ import { BookingsService } from '../booking/bookings/bookings.service';
 import { AssignWorkerDto } from '../booking/bookings/dto/assign-worker.dto';
 import { CancelBookingDto } from '../booking/bookings/dto/cancel-booking.dto';
 import {
+  addDaysToDateString,
   getTodayRange,
   toDateOnlyString,
   resolveReportDateRange,
@@ -285,6 +286,21 @@ export class ManagerService {
       if (l.status !== LeaveRequestStatus.APPROVED) continue;
       const key = toDateOnlyString(l.date)!;
       if (!attendanceByDate.has(key)) attendanceByDate.set(key, 'LEAVE');
+    }
+
+    // Same explicit gap-fill rule as WorkerService.getLeaveCalendar: an
+    // Attendance row is only ever created at check-in time, so a day with no
+    // row and no approved leave is a genuine no-show — ABSENT. Bounded by
+    // joiningDate (never touches a day before it) and stops at yesterday
+    // (today is still in progress).
+    const joiningStr = toDateOnlyString(managerProfile?.joiningDate ?? null);
+    const windowStart = toDateOnlyString(since)!;
+    const today = toDateOnlyString(new Date())!;
+    const yesterday = addDaysToDateString(today, -1);
+    let cursor = joiningStr && joiningStr > windowStart ? joiningStr : windowStart;
+    while (cursor <= yesterday) {
+      if (!attendanceByDate.has(cursor)) attendanceByDate.set(cursor, 'ABSENT');
+      cursor = addDaysToDateString(cursor, 1);
     }
 
     return {
