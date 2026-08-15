@@ -10,6 +10,7 @@ import {
   AttendanceStatus,
   BookingStatus,
   CommissionType,
+  LeaveRequestStatus,
   PaymentMethod,
   PaymentStatus,
   Prisma,
@@ -41,6 +42,7 @@ import { AuthUser } from '../common/types/auth-user.type';
 import { DuplicateCheckService } from '../common/services/duplicate-check.service';
 import { DashboardService } from '../dashboard/dashboard.service';
 import { LeavePolicyService } from '../leave-policy/leave-policy.service';
+import { LEAVE_TYPE_META } from '../leave-request/leave-request.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReportsService } from '../reports/reports.service';
@@ -244,6 +246,62 @@ export class ManagerService {
         // `attendances` array) so the Manager attendance screen never needs a second request.
         history: historyResult.data.attendances,
         historyMeta: historyResult.data.meta,
+      },
+    };
+  }
+
+  // Manager-panel counterpart of WorkerService.getLeaveCalendar — same output shape
+  // ({ joiningDate, attendance[], leaves[] }), built from the same WorkerLeaveRequest table
+  // (a manager's own leave request row also lives there, workerId = the manager's own userId,
+  // see applyManagerLeave) and the same generic AttendanceService.getHistory this manager's own
+  // GET managers/me/attendance already reuses — no new attendance query logic invented.
+  async getLeaveCalendar(user: AuthUser, days: number) {
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+
+    const [managerProfile, historyResult, leaves] = await Promise.all([
+      this.prisma.managerProfile.findUnique({
+        where: { userId: user.id },
+        select: { joiningDate: true },
+      }),
+      this.attendanceService.getHistory(user.id, {
+        startDate: toDateOnlyString(since) ?? undefined,
+        limit: days + 5,
+      }),
+      this.prisma.workerLeaveRequest.findMany({
+        where: { workerId: user.id },
+        orderBy: { date: 'desc' },
+      }),
+    ]);
+
+    const attendanceByDate = new Map<string, 'PRESENT' | 'ABSENT' | 'LEAVE'>();
+    for (const row of historyResult.data.attendances) {
+      const key = toDateOnlyString(row.checkInTime)!;
+      attendanceByDate.set(key, row.status === AttendanceStatus.ABSENT ? 'ABSENT' : 'PRESENT');
+    }
+    // Approved-leave dates fill in LEAVE for any day with no attendance row at all — same rule
+    // as the worker calendar (an actual Attendance row always wins if one exists).
+    for (const l of leaves) {
+      if (l.status !== LeaveRequestStatus.APPROVED) continue;
+      const key = toDateOnlyString(l.date)!;
+      if (!attendanceByDate.has(key)) attendanceByDate.set(key, 'LEAVE');
+    }
+
+    return {
+      success: true,
+      data: {
+        joiningDate: toDateOnlyString(managerProfile?.joiningDate ?? null),
+        attendance: Array.from(attendanceByDate.entries())
+          .map(([date, status]) => ({ date, status }))
+          .sort((a, b) => b.date.localeCompare(a.date)),
+        leaves: leaves.map((l) => ({
+          startDate: toDateOnlyString(l.date)!,
+          endDate: toDateOnlyString(l.date)!,
+          leaveType: l.type,
+          leaveTypeCode: LEAVE_TYPE_META[l.type].code,
+          leaveTypeName: LEAVE_TYPE_META[l.type].name,
+          status: l.status,
+        })),
       },
     };
   }

@@ -464,6 +464,9 @@ model ManagerProfile {
   bankIfsc          String?
   upiId             String?
   remarks           String?
+  // Distinct from dateOfBirth — when this manager actually joined the
+  // company, mirrors WorkerProfile.joiningDate's convention exactly.
+  joiningDate       DateTime?
   createdAt         DateTime               @default(now())
   updatedAt         DateTime               @updatedAt
 

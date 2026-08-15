@@ -18,6 +18,7 @@ import { AuthUser } from '../common/types/auth-user.type';
 import { ApplyLeaveDto } from '../leave-request/dto/apply-leave.dto';
 import { LeaveStatusQueryDto } from '../leave-request/dto/leave-status-query.dto';
 import { LeaveRequestService } from '../leave-request/leave-request.service';
+import { QueryAttendanceHistoryDto } from '../worker/dto/query-attendance-history.dto';
 import { ManagerAreaQueryDto } from './dto/manager-area-query.dto';
 import { ManagerService } from './manager.service';
 
@@ -67,6 +68,20 @@ export class ManagerController {
   @ApiResponse({ status: 404, description: 'Leave request not found' })
   cancelLeave(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthUser) {
     return this.leaveRequestService.cancelLeave(user.id, id);
+  }
+
+  @Get('leaves/calendar')
+  @ApiOperation({
+    summary: "Logged-in manager's attendance-aware leave calendar — MANAGER",
+    description:
+      'Same shape as GET workers/me/leaves/calendar: joiningDate (from ManagerProfile, null if ' +
+      'not set), per-day attendance status for the last `days` days (1-90, default 30), and the ' +
+      "manager's own leave requests with their leaveTypeCode/leaveTypeName.",
+  })
+  @ApiResponse({ status: 200, description: 'Leave calendar data' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  getLeaveCalendar(@CurrentUser() user: AuthUser, @Query() query: QueryAttendanceHistoryDto) {
+    return this.managerService.getLeaveCalendar(user, query.days ?? 30);
   }
 
   @Get('dashboard')

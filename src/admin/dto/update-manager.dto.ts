@@ -139,6 +139,14 @@ export class UpdateManagerDto {
   dateOfBirth?: string;
 
   @ApiPropertyOptional({
+    example: '2026-06-15',
+    description: 'ISO date string — when this manager actually joined. Distinct from dateOfBirth.',
+  })
+  @IsOptional()
+  @IsDateString()
+  joiningDate?: string;
+
+  @ApiPropertyOptional({
     example: '221B Baker Street, Bengaluru, Karnataka',
     description: 'Free-text address, max 500 characters',
   })

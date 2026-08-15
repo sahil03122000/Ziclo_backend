@@ -1457,6 +1457,9 @@ export class AdminService {
               dateOfBirth: dto.dateOfBirth
                 ? new Date(dto.dateOfBirth)
                 : undefined,
+              joiningDate: dto.joiningDate
+                ? new Date(dto.joiningDate)
+                : undefined,
               address: dto.address,
               salaryType: SalaryType.SALARY,
               employmentType: dto.employmentType,
@@ -1482,6 +1485,7 @@ export class AdminService {
               shiftRef: true,
               gender: true,
               dateOfBirth: true,
+              joiningDate: true,
               address: true,
               officeLocationId: true,
               officeLocation: { select: { id: true, name: true } },
@@ -1820,6 +1824,8 @@ export class AdminService {
     if (dto.gender !== undefined) profileUpdate.gender = dto.gender;
     if (dto.dateOfBirth !== undefined)
       profileUpdate.dateOfBirth = new Date(dto.dateOfBirth);
+    if (dto.joiningDate !== undefined)
+      profileUpdate.joiningDate = new Date(dto.joiningDate);
     if (dto.address !== undefined) profileUpdate.address = dto.address;
     if (dto.employmentType !== undefined)
       profileUpdate.employmentType = dto.employmentType;
@@ -1865,6 +1871,7 @@ export class AdminService {
       shiftRef: true,
       gender: true,
       dateOfBirth: true,
+      joiningDate: true,
       address: true,
       officeLocationId: true,
       officeLocation: { select: { id: true, name: true } },
