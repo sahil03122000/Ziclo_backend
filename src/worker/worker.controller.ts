@@ -76,6 +76,22 @@ export class WorkerController {
     return this.leaveRequestService.applyLeave(user.id, dto);
   }
 
+  @Get('leaves/calendar')
+  @ApiOperation({
+    summary: 'Attendance-aware leave calendar data — WORKER (Worker Panel: Leave)',
+    description:
+      'joiningDate (WorkerProfile), per-day attendance status (PRESENT/ABSENT/LEAVE — reuses ' +
+      'the same day-outcome logic as GET workers/me/attendance/history, with approved-leave ' +
+      'dates filled in as LEAVE), and this worker\'s own leave requests with their type code/name ' +
+      '(reused from GET workers/me/leaves, in the same paginate-free list shape) — everything the ' +
+      'calendar needs in one call. ?days= controls how far back attendance is included (same ' +
+      'range/default as attendance/history).',
+  })
+  @ApiResponse({ status: 200, description: 'Calendar data' })
+  getLeaveCalendar(@CurrentUser() user: AuthUser, @Query() query: QueryAttendanceHistoryDto) {
+    return this.workerService.getLeaveCalendar(user.id, query.days ?? 30);
+  }
+
   @Get('leaves')
   @ApiOperation({
     summary: "Logged-in worker's leave request history — WORKER (Worker Panel: Leave Request)",

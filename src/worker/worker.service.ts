@@ -1,8 +1,9 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { AttendanceStatus, BookingStatus } from '@prisma/client';
+import { AttendanceStatus, BookingStatus, LeaveRequestStatus } from '@prisma/client';
 
 import { AttendanceService } from '../attendance/attendance.service';
 import { getTodayRange } from '../common/utils/date.util';
+import { LEAVE_TYPE_META } from '../leave-request/leave-request.service';
 import { LeavePolicyService } from '../leave-policy/leave-policy.service';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -74,7 +75,7 @@ export class WorkerService {
           select: {
             address: true, aadhaarNumber: true, panNumber: true,
             salaryType: true, salaryAmount: true, commissionPercent: true,
-            areaId: true, area: { select: { name: true } },
+            areaId: true, area: { select: { name: true } }, joiningDate: true,
           },
         },
       },
@@ -102,6 +103,64 @@ export class WorkerService {
         commissionPct: user.workerProfile.commissionPercent ?? 0,
         assignedAreaName: user.workerProfile.area?.name ?? '',
         reportingManager,
+        joiningDate: user.workerProfile.joiningDate ? fmtDate(user.workerProfile.joiningDate) : null,
+      },
+    };
+  }
+
+  // ─── Leave calendar (Worker Panel: Leave — attendance-aware calendar) ─────────────
+  // Aggregates three already-existing, independently-fetchable pieces into one response so the
+  // frontend calendar doesn't need three separate round trips: joiningDate (WorkerProfile,
+  // same field getProfile() now also returns), per-day attendance status (reuses
+  // getAttendanceHistory's exact grouping/outcome logic — not re-derived), and this worker's
+  // own leave requests (reuses WorkerLeaveRequest via the existing leave-request read path).
+  // No new attendance or leave model — purely a read-side aggregation.
+  async getLeaveCalendar(userId: string, days: number) {
+    const workerProfile = await this.prisma.workerProfile.findUnique({
+      where: { userId },
+      select: { joiningDate: true },
+    });
+    if (!workerProfile) throw new NotFoundException('Worker profile not found');
+
+    const [attendanceHistory, leaves] = await Promise.all([
+      this.getAttendanceHistory(userId, days),
+      this.prisma.workerLeaveRequest.findMany({
+        where: { workerId: userId },
+        orderBy: { date: 'desc' },
+      }),
+    ]);
+
+    // 'half-day' has no single PRESENT/ABSENT/LEAVE bucket of its own in the calendar contract
+    // requested — treated as PRESENT (the worker did attend), same as how
+    // resolveAttendanceOutcome only distinguishes it for payroll/summary purposes, not
+    // attendance-vs-absence.
+    const attendanceByDate = new Map<string, 'PRESENT' | 'ABSENT' | 'LEAVE'>(
+      attendanceHistory.data.map((r) => [r.date, r.status === 'absent' ? 'ABSENT' : 'PRESENT']),
+    );
+    // Approved-leave dates fill in LEAVE for any day with no attendance row at all (the worker
+    // didn't check in — expected, they were on leave). An actual Attendance row always wins if
+    // one somehow exists for the same date, since that's a directly-observed fact.
+    for (const l of leaves) {
+      if (l.status !== LeaveRequestStatus.APPROVED) continue;
+      const key = fmtDate(l.date);
+      if (!attendanceByDate.has(key)) attendanceByDate.set(key, 'LEAVE');
+    }
+
+    return {
+      success: true,
+      data: {
+        joiningDate: workerProfile.joiningDate ? fmtDate(workerProfile.joiningDate) : null,
+        attendance: Array.from(attendanceByDate.entries())
+          .map(([date, status]) => ({ date, status }))
+          .sort((a, b) => b.date.localeCompare(a.date)),
+        leaves: leaves.map((l) => ({
+          startDate: fmtDate(l.date),
+          endDate: fmtDate(l.date),
+          leaveType: l.type,
+          leaveTypeCode: LEAVE_TYPE_META[l.type].code,
+          leaveTypeName: LEAVE_TYPE_META[l.type].name,
+          status: l.status,
+        })),
       },
     };
   }

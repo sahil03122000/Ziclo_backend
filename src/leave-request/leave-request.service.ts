@@ -7,6 +7,7 @@ import {
 import {
   ActivityAction,
   ActivityModule,
+  AttendanceStatus,
   AuditAction,
   LeaveApprovalLevel,
   LeaveRequestStatus,
@@ -33,6 +34,18 @@ const LEAVE_REQUEST_DAYS = 1;
 const POLICY_GOVERNED_TYPES = new Set<LeaveType>([LeaveType.CASUAL, LeaveType.SICK, LeaveType.PLANNED]);
 
 const fmtDate = (d: Date) => d.toISOString().split('T')[0];
+
+// The actual LeaveType enum in this schema (schema.prisma) is SICK/CASUAL/PLANNED/EMERGENCY —
+// there is no PAID/UNPAID/LWP/EARNED member to expose a code for (LWP is a balance concept
+// derived automatically when paid balance runs out, never a type a worker selects — see
+// LeavePolicyService.deductForApprovedLeave). Codes/names below are a stable, backend-owned
+// display mapping over the real enum, not a second leave-type system.
+export const LEAVE_TYPE_META: Record<LeaveType, { code: string; name: string }> = {
+  SICK: { code: 'SL', name: 'Sick Leave' },
+  CASUAL: { code: 'CL', name: 'Casual Leave' },
+  PLANNED: { code: 'PL', name: 'Planned Leave' },
+  EMERGENCY: { code: 'EL', name: 'Emergency Leave' },
+};
 
 const REQUEST_INCLUDE = {
   worker: { select: { id: true, name: true, email: true, phone: true, profileImage: true } },
@@ -66,12 +79,35 @@ export class LeaveRequestService {
   // ─── Worker ───────────────────────────────────────────────────────────────────
 
   async applyLeave(userId: string, dto: ApplyLeaveDto) {
-    await this.assertApplicable(userId, dto);
-
     const workerProfile = await this.prisma.workerProfile.findUnique({
       where: { userId },
-      select: { areaId: true },
+      select: { areaId: true, joiningDate: true },
     });
+
+    await this.assertApplicable(userId, dto);
+
+    // Worker-only checks (ManagerProfile has no joiningDate, and a manager's own leave has no
+    // Attendance concept the same way) — see assertApplicable for the shared past-date/overlap
+    // checks that apply to both.
+    if (workerProfile?.joiningDate) {
+      const joining = new Date(workerProfile.joiningDate);
+      joining.setHours(0, 0, 0, 0);
+      if (new Date(dto.date) < joining) {
+        throw new BadRequestException('Cannot apply for leave before your joining date');
+      }
+    }
+    const existingAttendance = await this.prisma.attendance.findFirst({
+      where: {
+        userId,
+        checkInTime: { gte: new Date(dto.date), lt: new Date(new Date(dto.date).getTime() + 24 * 60 * 60 * 1000) },
+        status: { notIn: [AttendanceStatus.ABSENT] },
+      },
+      select: { id: true },
+    });
+    if (existingAttendance) {
+      throw new BadRequestException('Cannot apply for leave on a date you were already present');
+    }
+
     const managerId = await this.resolveManagerUserId(workerProfile?.areaId ?? null);
     const policy = (await this.leavePolicyService.getPolicy()).data;
 
