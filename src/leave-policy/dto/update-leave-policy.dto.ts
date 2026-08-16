@@ -100,6 +100,34 @@ export class UpdateLeavePolicyDto {
   @IsBoolean()
   plannedEnabled?: boolean;
 
+  // ── Paid Leave ────────────────────────────────────────────────────────────────
+  @ApiPropertyOptional({ example: 1 })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  paidMonthlyAllocation?: number;
+
+  @ApiPropertyOptional({ example: true })
+  @IsOptional()
+  @IsBoolean()
+  paidCarryForwardEnabled?: boolean;
+
+  @ApiPropertyOptional({ description: 'null/omitted = unlimited carry forward', nullable: true })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  paidCarryForwardLimit?: number | null;
+
+  @ApiPropertyOptional({ example: true })
+  @IsOptional()
+  @IsBoolean()
+  paidFinancialYearReset?: boolean;
+
+  @ApiPropertyOptional({ example: true })
+  @IsOptional()
+  @IsBoolean()
+  paidEnabled?: boolean;
+
   // ── Approval flow ─────────────────────────────────────────────────────────────
   @ApiPropertyOptional({
     example: false,

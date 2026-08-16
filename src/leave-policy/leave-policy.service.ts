@@ -25,6 +25,11 @@ export interface LeavePolicyData {
   plannedCarryForwardLimit: number | null;
   plannedFinancialYearReset: boolean;
   plannedEnabled: boolean;
+  paidMonthlyAllocation: number;
+  paidCarryForwardEnabled: boolean;
+  paidCarryForwardLimit: number | null;
+  paidFinancialYearReset: boolean;
+  paidEnabled: boolean;
   requireAdminLeaveApproval: boolean;
 }
 
@@ -46,6 +51,11 @@ export const LEAVE_POLICY_DEFAULTS: LeavePolicyData = {
   plannedCarryForwardLimit: null,
   plannedFinancialYearReset: false,
   plannedEnabled: true,
+  paidMonthlyAllocation: 1,
+  paidCarryForwardEnabled: true,
+  paidCarryForwardLimit: null,
+  paidFinancialYearReset: true,
+  paidEnabled: true,
   requireAdminLeaveApproval: false,
 };
 
@@ -55,10 +65,11 @@ export const LEAVE_POLICY_DEFAULTS: LeavePolicyData = {
 // "allocated" is a gross running total (only grows, via allocation/carry-forward) — it is
 // NEVER decremented directly by usage. "used" is what apply/cancel actually mutate; the
 // spendable "remaining" balance is always (allocated - used), computed on every read.
-const BALANCE_FIELDS: Record<'CASUAL' | 'SICK' | 'PLANNED', { allocated: string; used: string }> = {
+const BALANCE_FIELDS: Record<'CASUAL' | 'SICK' | 'PLANNED' | 'PAID', { allocated: string; used: string }> = {
   CASUAL: { allocated: 'casualAllocated', used: 'casualUsed' },
   SICK: { allocated: 'sickAllocated', used: 'sickUsed' },
   PLANNED: { allocated: 'plannedAllocated', used: 'plannedUsed' },
+  PAID: { allocated: 'paidAllocated', used: 'paidUsed' },
 };
 
 export type PolicyGovernedType = keyof typeof BALANCE_FIELDS;
@@ -96,6 +107,11 @@ export class LeavePolicyService {
         plannedCarryForwardLimit: row.plannedCarryForwardLimit,
         plannedFinancialYearReset: row.plannedFinancialYearReset,
         plannedEnabled: row.plannedEnabled,
+        paidMonthlyAllocation: row.paidMonthlyAllocation,
+        paidCarryForwardEnabled: row.paidCarryForwardEnabled,
+        paidCarryForwardLimit: row.paidCarryForwardLimit,
+        paidFinancialYearReset: row.paidFinancialYearReset,
+        paidEnabled: row.paidEnabled,
         requireAdminLeaveApproval: row.requireAdminLeaveApproval,
       },
     };
@@ -152,7 +168,7 @@ export class LeavePolicyService {
       // look unavailable.
       this.prisma.workerLeaveRequest.groupBy({
         by: ['type'],
-        where: { workerId: userId, status: LeaveRequestStatus.PENDING, type: { in: ['CASUAL', 'SICK', 'PLANNED'] } },
+        where: { workerId: userId, status: LeaveRequestStatus.PENDING, type: { in: ['CASUAL', 'SICK', 'PLANNED', 'PAID'] } },
         _count: { _all: true },
       }),
     ]);
@@ -162,6 +178,7 @@ export class LeavePolicyService {
       CASUAL: 'casualMonthlyAllocation',
       SICK: 'sickYearlyAllocation',
       PLANNED: 'plannedMonthlyAllocation',
+      PAID: 'paidMonthlyAllocation',
     };
     const shape = (type: PolicyGovernedType) => {
       const fields = BALANCE_FIELDS[type];
@@ -182,6 +199,7 @@ export class LeavePolicyService {
         casual: shape('CASUAL'),
         sick: shape('SICK'),
         planned: shape('PLANNED'),
+        paid: shape('PAID'),
         // LWP has no entitled/allocated pool — it's whatever is left once all paid leave is
         // exhausted, so `remaining` mirrors `used` (both are the same running unpaid-days
         // total) rather than implying a cap that doesn't exist.
@@ -213,6 +231,9 @@ export class LeavePolicyService {
     }
     if (policy.plannedEnabled && policy.plannedMonthlyAllocation > 0) {
       await this.credit(userId, 'PLANNED', policy.plannedMonthlyAllocation, LeaveTransactionType.ALLOCATION, 'Initial grant on onboarding');
+    }
+    if (policy.paidEnabled && policy.paidMonthlyAllocation > 0) {
+      await this.credit(userId, 'PAID', policy.paidMonthlyAllocation, LeaveTransactionType.ALLOCATION, 'Initial grant on onboarding');
     }
     return this.prisma.leaveBalance.findUniqueOrThrow({ where: { userId } });
   }
@@ -332,6 +353,9 @@ export class LeavePolicyService {
       if (policy.plannedEnabled && policy.plannedMonthlyAllocation > 0) {
         await this.credit(employee.id, 'PLANNED', policy.plannedMonthlyAllocation, LeaveTransactionType.ALLOCATION, `Monthly allocation — ${thisMonthKey}`);
       }
+      if (policy.paidEnabled && policy.paidMonthlyAllocation > 0) {
+        await this.credit(employee.id, 'PAID', policy.paidMonthlyAllocation, LeaveTransactionType.ALLOCATION, `Monthly allocation — ${thisMonthKey}`);
+      }
     }
 
     await this.prisma.leavePolicy.update({
@@ -377,6 +401,7 @@ export class LeavePolicyService {
       await this.resetTypeAtFinancialYearEnd(userId, 'SICK', policy.sickFinancialYearReset, policy.sickCarryForwardEnabled, policy.sickCarryForwardLimit);
       // Planned: "No yearly reset" by default — only touched if explicitly enabled.
       await this.resetTypeAtFinancialYearEnd(userId, 'PLANNED', policy.plannedFinancialYearReset, policy.plannedCarryForwardEnabled, policy.plannedCarryForwardLimit);
+      await this.resetTypeAtFinancialYearEnd(userId, 'PAID', policy.paidFinancialYearReset, policy.paidCarryForwardEnabled, policy.paidCarryForwardLimit);
 
       // Sick is a yearly (not monthly) allocation — granted fresh at the start of each
       // financial year, right after the reset/carry-forward step above.

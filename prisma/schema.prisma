@@ -134,6 +134,11 @@ enum LeaveType {
   // this type bypass the balance check entirely (kept for backward compatibility with the
   // existing worker leave-request flow).
   EMERGENCY
+  // Paid Leave — policy-governed exactly like Casual/Planned (monthly accrual, LeavePolicy
+  // paidMonthlyAllocation/paidCarryForward*/paidFinancialYearReset/paidEnabled, LeaveBalance
+  // paidAllocated/paidUsed). Displayed as code "PD" (not "PL") since Planned Leave already
+  // owns the "PL" short code — see LEAVE_TYPE_META.
+  PAID
 }
 
 enum LeaveRequestStatus {
@@ -663,6 +668,13 @@ model LeavePolicy {
   plannedFinancialYearReset  Boolean @default(false)
   plannedEnabled             Boolean @default(true)
 
+  // ── Paid Leave ────────────────────────────────────────────────────────────────
+  paidMonthlyAllocation   Float   @default(1)
+  paidCarryForwardEnabled Boolean @default(true)
+  paidCarryForwardLimit   Float? // null = unlimited
+  paidFinancialYearReset  Boolean @default(true)
+  paidEnabled             Boolean @default(true)
+
   // Worker → Manager Approval → (Optional) Admin Approval — when true, every manager
   // approval escalates to an admin instead of finalizing (mirrors
   // AttendanceRule.requireAdminAttendanceApproval for missed checkouts).
@@ -695,6 +707,8 @@ model LeaveBalance {
   sickUsed         Float @default(0)
   plannedAllocated Float @default(0)
   plannedUsed      Float @default(0)
+  paidAllocated    Float @default(0)
+  paidUsed         Float @default(0)
 
   // Days recorded as an unpaid absence (missed checkout that was never resolved to
   // PRESENT/HALF_DAY, or a rejected missed-checkout request) — reversed if a later approval

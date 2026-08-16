@@ -1,0 +1,15 @@
+-- AlterEnum
+ALTER TYPE "LeaveType" ADD VALUE 'PAID';
+
+-- AlterTable
+ALTER TABLE "LeavePolicy"
+  ADD COLUMN "paidMonthlyAllocation" DOUBLE PRECISION NOT NULL DEFAULT 1,
+  ADD COLUMN "paidCarryForwardEnabled" BOOLEAN NOT NULL DEFAULT true,
+  ADD COLUMN "paidCarryForwardLimit" DOUBLE PRECISION,
+  ADD COLUMN "paidFinancialYearReset" BOOLEAN NOT NULL DEFAULT true,
+  ADD COLUMN "paidEnabled" BOOLEAN NOT NULL DEFAULT true;
+
+-- AlterTable
+ALTER TABLE "LeaveBalance"
+  ADD COLUMN "paidAllocated" DOUBLE PRECISION NOT NULL DEFAULT 0,
+  ADD COLUMN "paidUsed" DOUBLE PRECISION NOT NULL DEFAULT 0;

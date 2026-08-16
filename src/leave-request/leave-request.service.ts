@@ -30,21 +30,24 @@ import { RejectLeaveRequestDto } from './dto/reject-leave-request.dto';
 const LEAVE_REQUEST_DAYS = 1;
 
 // EMERGENCY is not governed by LeavePolicy (see the LeaveType enum comment in schema.prisma)
-// — no balance exists for it, so it bypasses the deduction step entirely.
-const POLICY_GOVERNED_TYPES = new Set<LeaveType>([LeaveType.CASUAL, LeaveType.SICK, LeaveType.PLANNED]);
+// — no balance exists for it, so it bypasses the deduction step entirely. PAID is policy-
+// governed exactly like CASUAL/SICK/PLANNED (see LeavePolicyService).
+const POLICY_GOVERNED_TYPES = new Set<LeaveType>([LeaveType.CASUAL, LeaveType.SICK, LeaveType.PLANNED, LeaveType.PAID]);
 
 const fmtDate = (d: Date) => d.toISOString().split('T')[0];
 
-// The actual LeaveType enum in this schema (schema.prisma) is SICK/CASUAL/PLANNED/EMERGENCY —
-// there is no PAID/UNPAID/LWP/EARNED member to expose a code for (LWP is a balance concept
-// derived automatically when paid balance runs out, never a type a worker selects — see
+// The actual LeaveType enum in this schema (schema.prisma) is SICK/CASUAL/PLANNED/EMERGENCY/
+// PAID — there is no separate UNPAID/LWP/EARNED member (LWP is a balance concept derived
+// automatically when paid balance runs out, never a type a worker selects — see
 // LeavePolicyService.deductForApprovedLeave). Codes/names below are a stable, backend-owned
-// display mapping over the real enum, not a second leave-type system.
+// display mapping over the real enum, not a second leave-type system. PAID uses code "PD"
+// (not "PL") because PLANNED already owns "PL".
 export const LEAVE_TYPE_META: Record<LeaveType, { code: string; name: string }> = {
   SICK: { code: 'SL', name: 'Sick Leave' },
   CASUAL: { code: 'CL', name: 'Casual Leave' },
   PLANNED: { code: 'PL', name: 'Planned Leave' },
   EMERGENCY: { code: 'EL', name: 'Emergency Leave' },
+  PAID: { code: 'PD', name: 'Paid Leave' },
 };
 
 const REQUEST_INCLUDE = {

@@ -46,7 +46,7 @@ export class LeavePolicyController {
   @Get('transactions')
   @ApiOperation({ summary: 'Get leave transaction history — ADMIN', description: 'Every allocation, carry-forward, reset, deduction, and refund — optionally filtered by employee and/or leave type.' })
   @ApiQuery({ name: 'userId', required: false, format: 'uuid' })
-  @ApiQuery({ name: 'leaveType', required: false, enum: ['SICK', 'CASUAL', 'PLANNED', 'EMERGENCY'] })
+  @ApiQuery({ name: 'leaveType', required: false, enum: ['SICK', 'CASUAL', 'PLANNED', 'EMERGENCY', 'PAID'] })
   @ApiResponse({ status: 200, description: 'Paginated leave transaction list' })
   getTransactions(@Query() query: QueryLeaveTransactionsDto) {
     return this.leavePolicyService.getTransactions(query);
