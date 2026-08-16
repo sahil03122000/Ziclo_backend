@@ -582,10 +582,31 @@ export class BookingsService {
     };
   }
 
+  // Root cause of "a new service request for a pincode the manager is assigned to never shows
+  // up in Manager Jobs": this is the actual endpoint the Manager Jobs screen calls (GET
+  // bookings/manager/me — see BookingsController), and buildWhere's managerId filter is an
+  // exact-match-only `Booking.managerId = X`. A brand-new request starts with managerId null
+  // (nobody has explicitly assigned it yet), so it was structurally invisible here regardless
+  // of pincode, even though a near-identical fix already exists for the separate `managers/jobs`
+  // endpoint (ManagerService.resolveManagerBookingScope). Adding the same
+  // Address.pincode-in-manager's-territory branch here closes the actual gap the frontend hits.
   async getManagerBookings(managerId: string, query: BookingQueryDto) {
     const { page = 1, limit = 20, status, serviceId, scheduledFrom, scheduledTo } = query;
     const skip = (page - 1) * limit;
-    const where = this.buildWhere({ managerId, status, serviceId, scheduledFrom, scheduledTo });
+    const baseWhere = this.buildWhere({ status, serviceId, scheduledFrom, scheduledTo });
+    const pincodes = await this.resolveManagerPincodes(managerId);
+
+    const where: Prisma.BookingWhereInput = {
+      AND: [
+        baseWhere,
+        {
+          OR: [
+            { managerId },
+            ...(pincodes.length > 0 ? [{ address: { pincode: { in: pincodes } } }] : []),
+          ],
+        },
+      ],
+    };
 
     const [bookings, total] = await this.prisma.$transaction([
       this.prisma.booking.findMany({ where, include: BOOKING_INCLUDE, skip, take: limit, orderBy: { scheduledAt: 'asc' } }),
@@ -596,6 +617,25 @@ export class BookingsService {
       success: true,
       data: { bookings, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } },
     };
+  }
+
+  // Same manager -> assigned Area/Pincode -> pincode-string resolution as
+  // ManagerService.resolveManagerPincodes (same underlying ManagerPincode/ManagerArea/Area/
+  // Pincode tables — not a second area/pincode mapping system, just queried from this module
+  // too since BookingsModule can't import ManagerModule here — ManagerModule already imports
+  // BookingsModule, and Nest doesn't allow the reverse). Only active Pincode/Area rows count,
+  // same "isActive" gate booking creation itself already enforces (see AreasService).
+  private async resolveManagerPincodes(managerUserId: string): Promise<string[]> {
+    const profile = await this.prisma.managerProfile.findUnique({
+      where: { userId: managerUserId },
+      select: {
+        pincodes: { where: { pincode: { isActive: true } }, select: { pincode: { select: { pincode: true } } } },
+        areas: { where: { area: { isActive: true } }, select: { area: { select: { pincode: true } } } },
+      },
+    });
+    if (!profile) return [];
+    if (profile.pincodes.length > 0) return profile.pincodes.map((p) => p.pincode.pincode);
+    return profile.areas.map((a) => a.area.pincode);
   }
 
   // Worker Panel "Jobs" screen — response shaped via toWorkerJobDto (see above) to match

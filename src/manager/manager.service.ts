@@ -560,8 +560,13 @@ export class ManagerService {
     const profile = await this.prisma.managerProfile.findUnique({
       where: { userId: managerUserId },
       select: {
-        pincodes: { select: { pincode: { select: { pincode: true } } } },
-        areas: { select: { area: { select: { pincode: true } } } },
+        // isActive filtered on both sides: an inactive Pincode/Area must not keep matching new
+        // jobs to it (existing business rule for area-level open/closed status — see
+        // AreasService/BookingConfigService), even if the manager is still nominally assigned
+        // to it. Matches the same "isActive" gate the booking-creation-time area check already
+        // enforces — this just applies it here too rather than inventing a second mechanism.
+        pincodes: { where: { pincode: { isActive: true } }, select: { pincode: { select: { pincode: true } } } },
+        areas: { where: { area: { isActive: true } }, select: { area: { select: { pincode: true } } } },
       },
     });
     if (!profile) return [];
