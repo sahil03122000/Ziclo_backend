@@ -116,9 +116,13 @@ export class WorkerService {
   // own leave requests (reuses WorkerLeaveRequest via the existing leave-request read path).
   // No new attendance or leave model — purely a read-side aggregation.
   async getLeaveCalendar(userId: string, days: number) {
+    // shiftRef is additive here purely so the calendar UI can compute
+    // "Weekly Off" (a day outside Shift.workingDays) honestly — no worker
+    // self-endpoint exposed shift before this; nothing else about the shift
+    // relation changes.
     const workerProfile = await this.prisma.workerProfile.findUnique({
       where: { userId },
-      select: { joiningDate: true },
+      select: { joiningDate: true, shiftRef: { select: { id: true, name: true, startTime: true, endTime: true, workingDays: true } } },
     });
     if (!workerProfile) throw new NotFoundException('Worker profile not found');
 
@@ -179,6 +183,15 @@ export class WorkerService {
           leaveTypeName: LEAVE_TYPE_META[l.type].name,
           status: l.status,
         })),
+        shift: workerProfile.shiftRef
+          ? {
+              id: workerProfile.shiftRef.id,
+              name: workerProfile.shiftRef.name,
+              startTime: workerProfile.shiftRef.startTime,
+              endTime: workerProfile.shiftRef.endTime,
+              workingDays: workerProfile.shiftRef.workingDays,
+            }
+          : null,
       },
     };
   }

@@ -263,7 +263,10 @@ export class ManagerService {
     const [managerProfile, historyResult, leaves] = await Promise.all([
       this.prisma.managerProfile.findUnique({
         where: { userId: user.id },
-        select: { joiningDate: true },
+        // shiftRef is additive here purely so the calendar UI can compute
+        // "Weekly Off" (a day outside Shift.workingDays) the same way the
+        // worker calendar now does — no other behavior changes.
+        select: { joiningDate: true, shiftRef: { select: { id: true, name: true, startTime: true, endTime: true, workingDays: true } } },
       }),
       this.attendanceService.getHistory(user.id, {
         startDate: toDateOnlyString(since) ?? undefined,
@@ -318,6 +321,15 @@ export class ManagerService {
           leaveTypeName: LEAVE_TYPE_META[l.type].name,
           status: l.status,
         })),
+        shift: managerProfile?.shiftRef
+          ? {
+              id: managerProfile.shiftRef.id,
+              name: managerProfile.shiftRef.name,
+              startTime: managerProfile.shiftRef.startTime,
+              endTime: managerProfile.shiftRef.endTime,
+              workingDays: managerProfile.shiftRef.workingDays,
+            }
+          : null,
       },
     };
   }
