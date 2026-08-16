@@ -36,6 +36,15 @@ const INVOICE_INCLUDE: Prisma.InvoiceInclude = {
       scheduledAt: true,
       status: true,
       service: { select: { id: true, name: true } },
+      // Payment-breakdown source fields — see computeBookingPaymentSummary in findOne().
+      totalAmount: true,
+      advanceAmount: true,
+      paymentStatus: true,
+      paymentMethod: true,
+      paidAt: true,
+      razorpayPaymentId: true,
+      paymentCollectionMethod: true,
+      paymentCollectedAt: true,
     },
   },
   payments: {
@@ -338,7 +347,15 @@ export class InvoicesService {
   async findOne(id: string) {
     const invoice = await this.prisma.invoice.findUnique({ where: { id }, include: INVOICE_INCLUDE });
     if (!invoice) throw new NotFoundException('Invoice not found');
-    return { success: true, data: invoice };
+
+    // Additive — invoice.total/items are unchanged (still whatever was actually invoiced, e.g.
+    // just the advance for an ADVANCE-type invoice). paymentSummary is the real booking-level
+    // payment state (Total/Advance/Paid/Remaining/status/method/txn) — never advanceAmount
+    // mistaken for paidAmount. Same derivation BookingsService.getSummary() and the PDF use.
+    const successPayments = invoice.payments.filter((p) => p.status === PaymentStatus.SUCCESS);
+    const paymentSummary = this.computeBookingPaymentSummary(invoice.booking, successPayments);
+
+    return { success: true, data: { ...invoice, paymentSummary } };
   }
 
   // ─── Mutations ────────────────────────────────────────────────────────────────
@@ -587,27 +604,39 @@ export class InvoicesService {
   // instead of local disk, so pdfUrl is a real, persistent Cloudinary URL. No new storage
   // dependency introduced — reuses the same `cloudinary` client and `invoices` folder the
   // upload allowlist already reserves (see VALID_UPLOAD_FOLDERS in uploads.service.ts).
+  // Root cause of "PDF download is not working": Cloudinary's Admin API signs
+  // private_download_url with a `timestamp` that it rejects as a "stale request" once more than
+  // 1 hour old (confirmed live — a URL generated hours earlier now 400s with exactly that
+  // message). The previous version generated this URL ONCE and cached it permanently in
+  // Invoice.pdfUrl, so every download attempt after that first hour was permanently broken,
+  // regardless of platform. Fixed by treating pdfGeneratedAt (not pdfUrl) as "has the file
+  // already been uploaded to Cloudinary" — the actual PDF asset is uploaded at most once (its
+  // Cloudinary public_id is fully deterministic: `ziclo/invoices/invoice-<invoiceNumber>`, no
+  // need to store it separately), but the signed download URL is regenerated fresh on every
+  // call — a local HMAC computation, no network round trip, so this is cheap.
   async getPdf(id: string, actor?: { id: string; role: Role }) {
     const invoice = await this.prisma.invoice.findUnique({
       where: { id },
-      select: { id: true, invoiceNumber: true, pdfUrl: true, pdfGeneratedAt: true, customerId: true },
+      select: { id: true, invoiceNumber: true, pdfGeneratedAt: true, customerId: true },
     });
     if (!invoice) throw new NotFoundException('Invoice not found');
     if (actor?.role === Role.USER && invoice.customerId !== actor.id) {
       throw new NotFoundException('Invoice not found');
     }
 
-    if (invoice.pdfUrl) {
-      return {
-        success: true,
-        data: { invoiceNumber: invoice.invoiceNumber, pdfUrl: invoice.pdfUrl, generatedAt: invoice.pdfGeneratedAt },
-      };
+    if (invoice.pdfGeneratedAt) {
+      const pdfUrl = this.buildInvoicePdfDownloadUrl(invoice.invoiceNumber);
+      await this.prisma.invoice.update({ where: { id }, data: { pdfUrl } });
+      return { success: true, data: { invoiceNumber: invoice.invoiceNumber, pdfUrl, generatedAt: invoice.pdfGeneratedAt } };
     }
 
     // Own narrow `select` (not INVOICE_INCLUDE) — precisely typed for exactly
     // what the PDF needs, side-stepping INVOICE_INCLUDE's widened `: Prisma.
     // InvoiceInclude` annotation losing its nested `booking.select.service`
-    // shape.
+    // shape. Also pulls in the same booking payment fields getSummary() uses, so the PDF can
+    // print the real payment breakdown (Total/Advance/Paid/Remaining/status/method/txn), not
+    // just the invoice's own line items/total (which, for an ADVANCE-type invoice, is only the
+    // advance portion — see ensureAdvanceInvoice).
     const full = await this.prisma.invoice.findUnique({
       where: { id },
       select: {
@@ -621,16 +650,37 @@ export class InvoicesService {
         isInterState: true,
         total: true,
         customer: { select: { name: true, email: true, phone: true } },
-        booking: { select: { scheduledAt: true, service: { select: { name: true } } } },
+        booking: {
+          select: {
+            scheduledAt: true,
+            service: { select: { name: true } },
+            totalAmount: true,
+            advanceAmount: true,
+            paymentStatus: true,
+            paymentMethod: true,
+            paidAt: true,
+            razorpayPaymentId: true,
+            paymentCollectionMethod: true,
+            paymentCollectedAt: true,
+          },
+        },
         items: { select: { description: true, quantity: true, unitPrice: true, amount: true }, orderBy: { createdAt: 'asc' } },
+        payments: {
+          where: { status: PaymentStatus.SUCCESS },
+          select: { amount: true, method: true, paidAt: true, transactions: { select: { razorpayPaymentId: true }, orderBy: { createdAt: 'desc' }, take: 1 } },
+          orderBy: { paidAt: 'desc' },
+        },
       },
     });
     if (!full) throw new NotFoundException('Invoice not found');
 
+    const paymentSummary = this.computeBookingPaymentSummary(full.booking, full.payments);
+
     let pdfUrl: string;
     try {
-      const buffer = await this.generateInvoicePdfBuffer(full);
-      pdfUrl = await this.uploadInvoicePdfToCloudinary(buffer, full.invoiceNumber);
+      const buffer = await this.generateInvoicePdfBuffer(full, paymentSummary);
+      const publicId = await this.uploadInvoicePdfToCloudinary(buffer, full.invoiceNumber);
+      pdfUrl = this.buildInvoicePdfDownloadUrl(publicId);
     } catch (err) {
       this.logger.error('[InvoicesService] PDF generation/upload failed:', err as Error);
       throw new InternalServerErrorException('Unable to generate invoice PDF.');
@@ -649,7 +699,22 @@ export class InvoicesService {
     };
   }
 
-  // Uploads a generated PDF buffer to Cloudinary and returns a durable download URL.
+  // Signed Admin-API download URL, freshly computed every call (see getPdf's comment on why —
+  // these expire ~1hr after generation). `invoiceNumber` alone is enough since the Cloudinary
+  // public_id is fully deterministic (see uploadInvoicePdfToCloudinary).
+  private buildInvoicePdfDownloadUrl(invoiceNumberOrPublicId: string): string {
+    const publicId = invoiceNumberOrPublicId.startsWith('ziclo/invoices/')
+      ? invoiceNumberOrPublicId
+      : `ziclo/invoices/invoice-${invoiceNumberOrPublicId}`;
+    return cloudinary.utils.private_download_url(publicId, 'pdf', {
+      resource_type: 'image',
+      type: 'authenticated',
+    });
+  }
+
+  // Uploads a generated PDF buffer to Cloudinary and returns its public_id (not a URL — see
+  // buildInvoicePdfDownloadUrl, which must be called fresh on every read since the signed
+  // download URL this account requires expires ~1hr after it's generated).
   //
   // This Cloudinary account has "Restricted media types" security enabled (an account-wide
   // dashboard setting) — confirmed live that it blocks ALL delivery of any .pdf asset (both
@@ -658,24 +723,63 @@ export class InvoicesService {
   // uploads this same app already does elsewhere deliver fine. The one path that does work is
   // the Admin API's private_download_url — an admin-authenticated (api_key+secret-signed)
   // download endpoint, not the public delivery CDN, so it isn't subject to that restriction;
-  // verified live to return the exact real PDF bytes (%PDF header, correct byte count). The
-  // signature has no expires_at, so it's safe to generate once and cache in Invoice.pdfUrl like
-  // any other permanent asset URL, same as this method's caller already assumes.
+  // verified live to return the exact real PDF bytes (%PDF header, correct byte count).
   private uploadInvoicePdfToCloudinary(buffer: Buffer, invoiceNumber: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const uploadStream = cloudinary.uploader.upload_stream(
         { folder: 'ziclo/invoices', public_id: `invoice-${invoiceNumber}`, resource_type: 'image', format: 'pdf', type: 'authenticated' },
         (error, result) => {
           if (error || !result) return reject(error ?? new Error('Cloudinary upload returned no result'));
-          const downloadUrl = cloudinary.utils.private_download_url(result.public_id, 'pdf', {
-            resource_type: 'image',
-            type: 'authenticated',
-          });
-          resolve(downloadUrl);
+          resolve(result.public_id);
         },
       );
       uploadStream.end(buffer);
     });
+  }
+
+  // Same paidAmount/remainingAmount/status/method/transactionId derivation
+  // BookingsService.getSummary() already uses (that logic lives in a different module —
+  // InvoicingModule can't import BookingsModule, BookingsModule already imports this one —
+  // so it's re-applied here directly against the same Booking columns, not re-invented).
+  // paidAmount is NEVER advanceAmount — it's the real sum of SUCCESS payments recorded against
+  // this invoice, or the full total if the worker's in-person cash/QR collection settled it
+  // (paymentCollectedAt set).
+  private computeBookingPaymentSummary(
+    booking: {
+      totalAmount: number | null;
+      advanceAmount: number | null;
+      paymentStatus: string;
+      paymentMethod: string | null;
+      paidAt: Date | null;
+      razorpayPaymentId: string | null;
+      paymentCollectionMethod: string | null;
+      paymentCollectedAt: Date | null;
+    } | null,
+    successPayments: {
+      amount: number;
+      method: string;
+      paidAt: Date | null;
+      transactions?: { razorpayPaymentId: string | null }[];
+    }[],
+  ) {
+    const totalAmount = Math.round(booking?.totalAmount ?? 0);
+    const onlinePaid = Math.round(successPayments.reduce((sum, p) => sum + p.amount, 0));
+    const paidAmount = booking?.paymentCollectedAt ? totalAmount : onlinePaid;
+    const remainingAmount = Math.max(0, totalAmount - paidAmount);
+    const latestPayment = successPayments[0];
+
+    return {
+      totalAmount,
+      advanceAmount: booking?.advanceAmount ?? null,
+      paidAmount,
+      remainingAmount,
+      status: booking?.paymentStatus ?? null,
+      method: latestPayment?.method ?? booking?.paymentMethod ?? null,
+      paidAt: latestPayment?.paidAt ?? booking?.paidAt ?? null,
+      transactionId: latestPayment?.transactions?.[0]?.razorpayPaymentId ?? booking?.razorpayPaymentId ?? null,
+      paymentCollectionMethod: booking?.paymentCollectionMethod ?? null,
+      paymentCollectedAt: booking?.paymentCollectedAt ?? null,
+    };
   }
 
   // Real invoice data only — customer, booking/service, line items, and the
@@ -700,6 +804,16 @@ export class InvoicesService {
       customer: { name: string; email: string; phone: string } | null;
       booking: { scheduledAt: Date; service: { name: string } } | null;
       items: { description: string; quantity: number; unitPrice: number; amount: number }[];
+    },
+    paymentSummary: {
+      totalAmount: number;
+      advanceAmount: number | null;
+      paidAmount: number;
+      remainingAmount: number;
+      status: string | null;
+      method: string | null;
+      paidAt: Date | null;
+      transactionId: string | null;
     },
   ): Promise<Buffer> {
     const doc = new PDFDocument({ margin: 40, size: 'A4' });
@@ -764,6 +878,32 @@ export class InvoicesService {
     }
     doc.font('Helvetica-Bold').fontSize(12).text('Total', 340, y);
     doc.text(`Rs. ${invoice.total.toFixed(2)}`, colX.amount, y);
+
+    // Booking payment breakdown — the invoice's own `total` above is only the advance portion
+    // for an ADVANCE-type invoice (see ensureAdvanceInvoice), so this section is what actually
+    // represents the booking's real payment state: Total/Advance/Paid/Remaining, never
+    // advanceAmount mistaken for paidAmount. Same derivation as the booking summary API
+    // (BookingsService.getSummary) — see computeBookingPaymentSummary.
+    y += 40;
+    doc.moveTo(40, y).lineTo(555, y).stroke();
+    y += 14;
+    doc.font('Helvetica-Bold').fontSize(11).text('Payment Details', 40, y);
+    y += 18;
+    const paymentRow = (label: string, value: string) => {
+      doc.font('Helvetica-Bold').fontSize(10).text(label, 40, y, { continued: true });
+      doc.font('Helvetica').text(`  ${value}`);
+      y = doc.y + 4;
+    };
+    paymentRow('Total Amount:', `Rs. ${paymentSummary.totalAmount.toFixed(2)}`);
+    if (paymentSummary.advanceAmount != null) {
+      paymentRow('Advance Amount:', `Rs. ${paymentSummary.advanceAmount.toFixed(2)}`);
+    }
+    paymentRow('Paid Amount:', `Rs. ${paymentSummary.paidAmount.toFixed(2)}`);
+    paymentRow('Remaining Amount:', `Rs. ${paymentSummary.remainingAmount.toFixed(2)}`);
+    if (paymentSummary.status) paymentRow('Payment Status:', paymentSummary.status);
+    if (paymentSummary.method) paymentRow('Payment Method:', paymentSummary.method);
+    if (paymentSummary.transactionId) paymentRow('Transaction ID:', paymentSummary.transactionId);
+    if (paymentSummary.paidAt) paymentRow('Payment Date:', new Date(paymentSummary.paidAt).toLocaleDateString('en-IN'));
 
     const done = new Promise<Buffer>((resolve, reject) => {
       doc.on('end', () => resolve(Buffer.concat(chunks)));

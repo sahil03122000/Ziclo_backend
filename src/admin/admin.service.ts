@@ -1677,6 +1677,13 @@ export class AdminService {
           officeLocation: {
             select: { id: true, name: true, latitude: true, longitude: true },
           },
+          // Multi office/area assignments — the legacy singular `officeLocation` above only
+          // ever reflected ManagerProfile.officeLocationId, and areas were never selected at
+          // all, so the manager list response had no way to show them (root cause of "Manager
+          // list does not show Assigned Area / Office Location"). Same relations
+          // getAreas()/getOfficeLocations() already use elsewhere in this file.
+          officeLocations: { select: { officeLocation: { select: { id: true, name: true } } } },
+          areas: { select: { area: { select: { id: true, name: true, pincode: true } } } },
         },
         skip,
         take: limit,
@@ -1706,6 +1713,18 @@ export class AdminService {
         officeLocation: p.officeLocation
           ? { id: p.officeLocation.id, name: p.officeLocation.name }
           : null,
+        // Additive — full multi-office/multi-area assignments (existing officeLocation above
+        // is kept unchanged for backward compatibility, still the legacy singular). Falls back
+        // to the singular officeLocation when the manager has no ManagerOfficeLocation rows
+        // (managers created before multi-office support existed), same fallback pattern
+        // getManagerOfficeIds() uses elsewhere.
+        officeLocations:
+          p.officeLocations.length > 0
+            ? p.officeLocations.map((o) => o.officeLocation)
+            : p.officeLocation
+              ? [{ id: p.officeLocation.id, name: p.officeLocation.name }]
+              : [],
+        areas: p.areas.map((a) => a.area),
         shift: p.shift,
         isActive: p.user.isActive,
         // PRESENT/NO_CHECKIN are the only two states derivable from today's Attendance row
