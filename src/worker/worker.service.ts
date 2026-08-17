@@ -2,7 +2,7 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { AttendanceStatus, BookingStatus, LeaveRequestStatus } from '@prisma/client';
 
 import { AttendanceService } from '../attendance/attendance.service';
-import { addDaysToDateString, getTodayRange } from '../common/utils/date.util';
+import { addDaysToDateString, getDayOfWeek, getTodayRange } from '../common/utils/date.util';
 import { LEAVE_TYPE_META } from '../leave-request/leave-request.service';
 import { LeavePolicyService } from '../leave-policy/leave-policy.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -158,13 +158,23 @@ export class WorkerService {
     // approved leave is a genuine no-show — ABSENT. Today is deliberately
     // excluded (still in progress, not yet a completed absence), and no day
     // before joiningDate is ever touched.
+    //
+    // A day outside the worker's own Shift.workingDays is never synthesized
+    // as ABSENT here — it's left out of `attendanceByDate` entirely so the
+    // frontend's own (single, shared) Weekly-Off rendering — driven by the
+    // same `shift.workingDays` returned below — is the one place that ever
+    // decides WO, never duplicated here. Without this, every weekly-off day
+    // would already be pinned to ABSENT before the frontend ever got a
+    // chance to recognize it as WO.
     const joiningStr = workerProfile.joiningDate ? fmtDate(workerProfile.joiningDate) : null;
     const windowStart = fmtDate(new Date(Date.now() - days * 24 * 60 * 60 * 1000));
     const today = fmtDate(new Date());
     const yesterday = addDaysToDateString(today, -1);
+    const workingDays = workerProfile.shiftRef?.workingDays ?? null;
     let cursor = joiningStr && joiningStr > windowStart ? joiningStr : windowStart;
     while (cursor <= yesterday) {
-      if (!attendanceByDate.has(cursor)) attendanceByDate.set(cursor, 'ABSENT');
+      const isWeeklyOff = workingDays != null && !workingDays.includes(getDayOfWeek(cursor));
+      if (!attendanceByDate.has(cursor) && !isWeeklyOff) attendanceByDate.set(cursor, 'ABSENT');
       cursor = addDaysToDateString(cursor, 1);
     }
 

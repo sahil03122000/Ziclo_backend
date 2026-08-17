@@ -68,6 +68,15 @@ export function addDaysToDateString(dateStr: string, days: number): string {
   return d.toISOString().slice(0, 10);
 }
 
+// Day of week for a 'YYYY-MM-DD' string, 0=Sunday..6=Saturday — same
+// convention as Shift.workingDays. Computed in UTC to match
+// addDaysToDateString above (the calendar gap-fill loops that call this
+// build/iterate their date strings in UTC too, so this must agree with them
+// rather than reintroduce a local-vs-UTC mismatch).
+export function getDayOfWeek(dateStr: string): number {
+  return new Date(`${dateStr}T00:00:00.000Z`).getUTCDay();
+}
+
 export type ReportPeriod = 'today' | 'week' | 'month';
 
 // Resolves a report date filter. Explicit startDate/endDate always win over `period`. `week`

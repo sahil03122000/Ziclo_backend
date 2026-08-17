@@ -33,6 +33,7 @@ import { AssignWorkerDto } from '../booking/bookings/dto/assign-worker.dto';
 import { CancelBookingDto } from '../booking/bookings/dto/cancel-booking.dto';
 import {
   addDaysToDateString,
+  getDayOfWeek,
   getTodayRange,
   toDateOnlyString,
   resolveReportDateRange,
@@ -295,14 +296,20 @@ export class ManagerService {
     // Attendance row is only ever created at check-in time, so a day with no
     // row and no approved leave is a genuine no-show — ABSENT. Bounded by
     // joiningDate (never touches a day before it) and stops at yesterday
-    // (today is still in progress).
+    // (today is still in progress). A day outside the manager's own
+    // Shift.workingDays is never synthesized as ABSENT — left out of
+    // `attendanceByDate` so the frontend's single shared Weekly-Off
+    // rendering (driven by the same `shift.workingDays` returned below)
+    // recognizes it as WO instead, never duplicated here.
     const joiningStr = toDateOnlyString(managerProfile?.joiningDate ?? null);
     const windowStart = toDateOnlyString(since)!;
     const today = toDateOnlyString(new Date())!;
     const yesterday = addDaysToDateString(today, -1);
+    const workingDays = managerProfile?.shiftRef?.workingDays ?? null;
     let cursor = joiningStr && joiningStr > windowStart ? joiningStr : windowStart;
     while (cursor <= yesterday) {
-      if (!attendanceByDate.has(cursor)) attendanceByDate.set(cursor, 'ABSENT');
+      const isWeeklyOff = workingDays != null && !workingDays.includes(getDayOfWeek(cursor));
+      if (!attendanceByDate.has(cursor) && !isWeeklyOff) attendanceByDate.set(cursor, 'ABSENT');
       cursor = addDaysToDateString(cursor, 1);
     }
 
