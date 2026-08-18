@@ -605,6 +605,18 @@ export class ManagerService {
     };
   }
 
+  // A booking's Address has real, plottable coordinates when it has one at all and its
+  // lat/lng aren't both exactly 0 — the placeholder value at least one real client
+  // address-creation flow has been observed to submit (Address.latitude/longitude are
+  // non-nullable Floats with no server-side default, so the backend always persists exactly
+  // what the client sent — 0,0 here means the client never obtained real GPS coordinates, not
+  // a genuine location off the coast of Africa). Never fabricates a coordinate — only reports
+  // whether the ones already on file are usable.
+  private hasValidLocation(address: { latitude: number; longitude: number } | null): boolean {
+    if (!address) return false;
+    return address.latitude !== 0 || address.longitude !== 0;
+  }
+
   // Confirms `bookingId` falls inside this manager's scope (own booking or own worker's
   // booking) — reuses resolveManagerBookingScope. Throws 404 (not 403) so a manager can't
   // probe for the existence of jobs outside their team.
@@ -2360,6 +2372,11 @@ export class ManagerService {
               },
             },
           },
+          // Was previously omitted entirely from the Jobs list — Manager Job Detail -> View
+          // Location had the coordinates (BookingsService.findOne includes the full Address
+          // row), but the list itself never surfaced them at all. Same select as job detail
+          // effectively returns (booking.address, via BOOKING_INCLUDE's `address: true`).
+          address: true,
         },
         skip: (page - 1) * limit,
         take: limit,
@@ -2382,6 +2399,12 @@ export class ManagerService {
         : null,
       area: b.worker?.workerProfile?.area ?? null,
       createdAt: b.createdAt,
+      address: b.address,
+      // Additive — distinguishes "no real coordinates" (address missing, or the historical
+      // 0,0 placeholder some client address-creation flows submitted) from an actual valid
+      // location, so "View Location" never has to guess or plot a fake pin. See
+      // hasValidLocation for what counts as valid.
+      locationAvailable: this.hasValidLocation(b.address),
     }));
 
     return {
@@ -2451,6 +2474,11 @@ export class ManagerService {
         package: booking.package,
         timeSlot: booking.timeSlot,
         address: booking.address,
+        // Same signal as the Jobs list (see hasValidLocation) — "View Location" should read
+        // this instead of inferring availability from whether address/lat/lng happen to be
+        // truthy (0 is a valid JS falsy value but is also the placeholder some client
+        // address-creation flows submitted, so a naive truthy check would misreport it).
+        locationAvailable: this.hasValidLocation(booking.address),
         officeLocations,
         area,
         timeline: booking.statusHistory,
