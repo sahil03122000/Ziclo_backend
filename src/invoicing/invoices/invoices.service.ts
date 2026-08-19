@@ -707,9 +707,13 @@ export class InvoicesService {
   // second, separate request to. Reuses getPdf() as-is for the existing generate-if-missing +
   // fresh-signed-URL + authorization logic (unchanged), then fetches those bytes server-side
   // (the Cloudinary Admin API signature never leaves the backend) and validates them before
-  // handing them to the client. If the cached asset turns out invalid (doesn't start with
-  // %PDF — e.g. a corrupted/incomplete prior upload), it's regenerated exactly once and
-  // re-validated, per "if stored PDF is invalid: regenerate it."
+  // handing them to the client. Regenerates exactly once, per "if stored PDF is invalid:
+  // regenerate it" — covers BOTH ways a cached asset can be invalid: the fetch itself failing
+  // (e.g. the underlying Cloudinary asset was deleted/never actually uploaded — root cause of a
+  // stale DB row confirming "generated" for an asset that no longer exists) and the fetch
+  // succeeding with bytes that aren't actually a PDF (corrupted/incomplete prior upload).
+  // Previously only the second case triggered regeneration — the first fell straight through to
+  // a hard 500, the exact "stale/missing stored PDF" gap this method now closes.
   async streamPdf(id: string, actor: { id: string; role: Role } | undefined): Promise<{ buffer: Buffer; filename: string }> {
     const result = await this.getPdf(id, actor);
     const invoiceNumber = result.data.invoiceNumber;
@@ -717,13 +721,13 @@ export class InvoicesService {
     // — avoid a redundant "INVOICE-INVOICE-..." filename when it already carries the prefix.
     const filename = /^invoice-/i.test(invoiceNumber) ? `${invoiceNumber}.pdf` : `INVOICE-${invoiceNumber}.pdf`;
 
-    let buffer = await this.fetchPdfBytes(result.data.pdfUrl!);
-    if (!this.looksLikePdf(buffer)) {
-      this.logger.warn(`[InvoicesService] Cached PDF for invoice ${id} failed validation — regenerating`);
+    let buffer = await this.tryFetchPdfBytes(result.data.pdfUrl!);
+    if (!buffer || !this.looksLikePdf(buffer)) {
+      this.logger.warn(`[InvoicesService] Cached PDF for invoice ${id} was missing/invalid — regenerating`);
       await this.prisma.invoice.update({ where: { id }, data: { pdfUrl: null, pdfGeneratedAt: null } });
       const regenerated = await this.getPdf(id, actor);
-      buffer = await this.fetchPdfBytes(regenerated.data.pdfUrl!);
-      if (!this.looksLikePdf(buffer)) {
+      buffer = await this.tryFetchPdfBytes(regenerated.data.pdfUrl!);
+      if (!buffer || !this.looksLikePdf(buffer)) {
         throw new InternalServerErrorException('Unable to generate invoice PDF.');
       }
     }
@@ -735,19 +739,21 @@ export class InvoicesService {
     return buffer.length > 4 && buffer.subarray(0, 4).toString('latin1') === '%PDF';
   }
 
-  private async fetchPdfBytes(url: string): Promise<Buffer> {
-    let response: Response;
+  // Never throws — a failed/non-ok fetch returns null so the caller can treat it exactly like
+  // an invalid buffer (regenerate), rather than only handling "fetched successfully but wrong
+  // content" and hard-failing on "couldn't fetch at all".
+  private async tryFetchPdfBytes(url: string): Promise<Buffer | null> {
     try {
-      response = await fetch(url);
+      const response = await fetch(url);
+      if (!response.ok) {
+        this.logger.warn(`[InvoicesService] PDF fetch returned ${response.status}: ${await response.text().catch(() => '')}`);
+        return null;
+      }
+      return Buffer.from(await response.arrayBuffer());
     } catch (err) {
-      this.logger.error('[InvoicesService] Failed to fetch generated invoice PDF:', err as Error);
-      throw new InternalServerErrorException('Unable to download generated invoice PDF.');
+      this.logger.warn(`[InvoicesService] Failed to fetch PDF bytes: ${(err as Error).message}`);
+      return null;
     }
-    if (!response.ok) {
-      this.logger.error(`[InvoicesService] PDF fetch returned ${response.status}: ${await response.text().catch(() => '')}`);
-      throw new InternalServerErrorException('Unable to download generated invoice PDF.');
-    }
-    return Buffer.from(await response.arrayBuffer());
   }
 
   // Signed Admin-API download URL, freshly computed every call (see getPdf's comment on why —
