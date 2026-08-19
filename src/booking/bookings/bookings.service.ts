@@ -510,6 +510,12 @@ export class BookingsService {
     const paidAmount = booking.paymentCollectedAt ? totalAmount : onlinePaid;
     const remainingAmount = Math.max(0, totalAmount - paidAmount);
     const latestPayment = booking.invoice?.payments[0];
+    // Same derived bucket InvoicesService.computeBookingPaymentSummary computes from the exact
+    // same numbers — the two live in different modules (can't share via DI, see that method's
+    // comment) so this is the identical formula re-applied here, not a second calculation.
+    // Invoice and Booking Summary must never disagree on this.
+    const paymentStatus =
+      totalAmount > 0 && paidAmount >= totalAmount ? 'PAID' : paidAmount > 0 ? 'PARTIALLY_PAID' : 'UNPAID';
 
     return {
       success: true,
@@ -534,6 +540,7 @@ export class BookingsService {
         },
         payment: {
           status: booking.paymentStatus,
+          paymentStatus,
           method: latestPayment?.method ?? booking.paymentMethod ?? null,
           paidAt: latestPayment?.paidAt ?? booking.paidAt ?? null,
           transactionId: latestPayment?.transactions[0]?.razorpayPaymentId ?? booking.razorpayPaymentId ?? null,

@@ -10,10 +10,12 @@ import {
   Patch,
   Post,
   Query,
+  Res,
   UseGuards,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiOperation, ApiParam, ApiProduces, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
+import { Response } from 'express';
 
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
@@ -228,13 +230,25 @@ export class InvoicesController {
 
   @Get(':id/pdf')
   @Roles(Role.ADMIN, Role.MANAGER, Role.USER)
-  @ApiOperation({ summary: 'Return the PDF URL for an invoice — generates it on first request if missing' })
+  @ApiProduces('application/pdf')
+  @ApiOperation({
+    summary: 'Download the invoice as a real PDF — generates it on first request if missing',
+    description:
+      'Returns actual PDF bytes (Content-Type: application/pdf, Content-Disposition: attachment; ' +
+      'filename="INVOICE-<invoiceNumber>.pdf") — not a JSON envelope with a URL. USER may only ' +
+      "download their own invoice.",
+  })
   @ApiParam({ name: 'id', description: 'Invoice UUID', format: 'uuid' })
-  @ApiResponse({ status: 200, description: 'PDF URL', schema: { example: { success: true, data: { pdfUrl: 'https://...', generatedAt: '2026-06-21T10:00:00Z' } } } })
+  @ApiResponse({ status: 200, description: 'PDF file' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   @ApiResponse({ status: 404, description: 'Invoice not found' })
-  getPdf(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthUser) {
-    return this.invoicesService.getPdf(id, user);
+  @ApiResponse({ status: 500, description: 'PDF generation failed' })
+  async getPdf(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthUser, @Res() res: Response): Promise<void> {
+    const { buffer, filename } = await this.invoicesService.streamPdf(id, user);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', String(buffer.length));
+    res.status(200).send(buffer);
   }
 
   @Patch(':id/cancel')

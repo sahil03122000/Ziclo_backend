@@ -652,8 +652,11 @@ export class InvoicesService {
         customer: { select: { name: true, email: true, phone: true } },
         booking: {
           select: {
+            id: true,
+            bookingRef: true,
             scheduledAt: true,
             service: { select: { name: true } },
+            timeSlot: { select: { startTime: true, endTime: true } },
             totalAmount: true,
             advanceAmount: true,
             paymentStatus: true,
@@ -697,6 +700,54 @@ export class InvoicesService {
       success: true,
       data: { invoiceNumber: updated.invoiceNumber, pdfUrl: updated.pdfUrl, generatedAt: updated.pdfGeneratedAt },
     };
+  }
+
+  // GET :id/pdf must hand the browser genuine PDF bytes directly (Content-Type: application/pdf,
+  // Content-Disposition: attachment) — not a JSON envelope with a URL the browser has to make a
+  // second, separate request to. Reuses getPdf() as-is for the existing generate-if-missing +
+  // fresh-signed-URL + authorization logic (unchanged), then fetches those bytes server-side
+  // (the Cloudinary Admin API signature never leaves the backend) and validates them before
+  // handing them to the client. If the cached asset turns out invalid (doesn't start with
+  // %PDF — e.g. a corrupted/incomplete prior upload), it's regenerated exactly once and
+  // re-validated, per "if stored PDF is invalid: regenerate it."
+  async streamPdf(id: string, actor: { id: string; role: Role } | undefined): Promise<{ buffer: Buffer; filename: string }> {
+    const result = await this.getPdf(id, actor);
+    const invoiceNumber = result.data.invoiceNumber;
+    // invoiceNumber is already formatted "INVOICE-YYYYMMDD-NNNNNN" (see generateInvoiceNumber)
+    // — avoid a redundant "INVOICE-INVOICE-..." filename when it already carries the prefix.
+    const filename = /^invoice-/i.test(invoiceNumber) ? `${invoiceNumber}.pdf` : `INVOICE-${invoiceNumber}.pdf`;
+
+    let buffer = await this.fetchPdfBytes(result.data.pdfUrl!);
+    if (!this.looksLikePdf(buffer)) {
+      this.logger.warn(`[InvoicesService] Cached PDF for invoice ${id} failed validation — regenerating`);
+      await this.prisma.invoice.update({ where: { id }, data: { pdfUrl: null, pdfGeneratedAt: null } });
+      const regenerated = await this.getPdf(id, actor);
+      buffer = await this.fetchPdfBytes(regenerated.data.pdfUrl!);
+      if (!this.looksLikePdf(buffer)) {
+        throw new InternalServerErrorException('Unable to generate invoice PDF.');
+      }
+    }
+
+    return { buffer, filename };
+  }
+
+  private looksLikePdf(buffer: Buffer): boolean {
+    return buffer.length > 4 && buffer.subarray(0, 4).toString('latin1') === '%PDF';
+  }
+
+  private async fetchPdfBytes(url: string): Promise<Buffer> {
+    let response: Response;
+    try {
+      response = await fetch(url);
+    } catch (err) {
+      this.logger.error('[InvoicesService] Failed to fetch generated invoice PDF:', err as Error);
+      throw new InternalServerErrorException('Unable to download generated invoice PDF.');
+    }
+    if (!response.ok) {
+      this.logger.error(`[InvoicesService] PDF fetch returned ${response.status}: ${await response.text().catch(() => '')}`);
+      throw new InternalServerErrorException('Unable to download generated invoice PDF.');
+    }
+    return Buffer.from(await response.arrayBuffer());
   }
 
   // Signed Admin-API download URL, freshly computed every call (see getPdf's comment on why —
@@ -768,11 +819,21 @@ export class InvoicesService {
     const remainingAmount = Math.max(0, totalAmount - paidAmount);
     const latestPayment = successPayments[0];
 
+    // Derived summary bucket — distinct from `status` (booking.paymentStatus, the raw Razorpay-
+    // specific CREATED/PENDING/SUCCESS/FAILED/REFUNDED enum). Reuses the exact same PAID/
+    // PARTIALLY_PAID wording InvoiceStatus/syncPaymentStatus already use for the identical
+    // paid-vs-total comparison — not a new persisted enum, just this same computation labeled
+    // for direct display (InvoiceStatus has no bespoke "nothing paid yet" member, so that one
+    // case is UNPAID here, informational only, never written to the database).
+    const paymentStatus =
+      totalAmount > 0 && paidAmount >= totalAmount ? 'PAID' : paidAmount > 0 ? 'PARTIALLY_PAID' : 'UNPAID';
+
     return {
       totalAmount,
       advanceAmount: booking?.advanceAmount ?? null,
       paidAmount,
       remainingAmount,
+      paymentStatus,
       status: booking?.paymentStatus ?? null,
       method: latestPayment?.method ?? booking?.paymentMethod ?? null,
       paidAt: latestPayment?.paidAt ?? booking?.paidAt ?? null,
@@ -802,7 +863,13 @@ export class InvoicesService {
       isInterState: boolean;
       total: number;
       customer: { name: string; email: string; phone: string } | null;
-      booking: { scheduledAt: Date; service: { name: string } } | null;
+      booking: {
+        id: string;
+        bookingRef: string | null;
+        scheduledAt: Date;
+        service: { name: string };
+        timeSlot: { startTime: string; endTime: string } | null;
+      } | null;
       items: { description: string; quantity: number; unitPrice: number; amount: number }[];
     },
     paymentSummary: {
@@ -810,7 +877,7 @@ export class InvoicesService {
       advanceAmount: number | null;
       paidAmount: number;
       remainingAmount: number;
-      status: string | null;
+      paymentStatus: string;
       method: string | null;
       paidAt: Date | null;
       transactionId: string | null;
@@ -821,23 +888,34 @@ export class InvoicesService {
     doc.on('data', (chunk: Buffer) => chunks.push(chunk));
 
     doc.rect(0, 0, doc.page.width, 70).fill('#1F4E79');
-    doc.fill('white').fontSize(18).font('Helvetica-Bold').text('Ziclo — Tax Invoice', 40, 22, { lineBreak: false });
-    doc.fontSize(10).font('Helvetica').text(`Invoice No: ${invoice.invoiceNumber}`, 40, 46, { lineBreak: false });
+    doc.fill('white').fontSize(20).font('Helvetica-Bold').text('INVOICE', 40, 18, { lineBreak: false });
+    doc.fontSize(10).font('Helvetica').text('Ziclo — Tax Invoice', 40, 42, { lineBreak: false });
     doc.fill('#000000');
 
     doc.moveDown(3);
-    doc.fontSize(10).font('Helvetica-Bold').text('Billed To');
-    doc.font('Helvetica').text(invoice.customer?.name ?? '—');
+    doc.font('Helvetica-Bold').fontSize(10).text('Invoice Number: ', { continued: true }).font('Helvetica').text(invoice.invoiceNumber);
+    doc.font('Helvetica-Bold').text('Invoice Date: ', { continued: true }).font('Helvetica').text(invoice.createdAt.toLocaleDateString('en-IN'));
+
+    doc.moveDown();
+    doc.font('Helvetica-Bold').fontSize(11).text('Customer Details');
+    doc.font('Helvetica').fontSize(10).text(invoice.customer?.name ?? '—');
     if (invoice.customer?.email) doc.text(invoice.customer.email);
     if (invoice.customer?.phone) doc.text(invoice.customer.phone);
 
     doc.moveDown();
-    doc.font('Helvetica-Bold').text('Invoice Date: ', { continued: true }).font('Helvetica').text(invoice.createdAt.toLocaleDateString('en-IN'));
+    doc.font('Helvetica-Bold').fontSize(11).text('Service Details');
+    doc.font('Helvetica').fontSize(10);
     if (invoice.booking?.service?.name) {
       doc.font('Helvetica-Bold').text('Service: ', { continued: true }).font('Helvetica').text(invoice.booking.service.name);
     }
+    if (invoice.booking?.bookingRef || invoice.booking?.id) {
+      doc.font('Helvetica-Bold').text('Booking ID: ', { continued: true }).font('Helvetica').text(invoice.booking.bookingRef ?? invoice.booking.id);
+    }
     if (invoice.booking?.scheduledAt) {
-      doc.font('Helvetica-Bold').text('Scheduled: ', { continued: true }).font('Helvetica').text(new Date(invoice.booking.scheduledAt).toLocaleDateString('en-IN'));
+      doc.font('Helvetica-Bold').text('Service Date: ', { continued: true }).font('Helvetica').text(new Date(invoice.booking.scheduledAt).toLocaleDateString('en-IN'));
+    }
+    if (invoice.booking?.timeSlot) {
+      doc.font('Helvetica-Bold').text('Time Slot: ', { continued: true }).font('Helvetica').text(`${invoice.booking.timeSlot.startTime} - ${invoice.booking.timeSlot.endTime}`);
     }
 
     doc.moveDown(1.5);
@@ -887,23 +965,32 @@ export class InvoicesService {
     y += 40;
     doc.moveTo(40, y).lineTo(555, y).stroke();
     y += 14;
-    doc.font('Helvetica-Bold').fontSize(11).text('Payment Details', 40, y);
+    doc.font('Helvetica-Bold').fontSize(11).text('PAYMENT SUMMARY', 40, y);
     y += 18;
-    const paymentRow = (label: string, value: string) => {
+    const row = (label: string, value: string) => {
       doc.font('Helvetica-Bold').fontSize(10).text(label, 40, y, { continued: true });
       doc.font('Helvetica').text(`  ${value}`);
       y = doc.y + 4;
     };
-    paymentRow('Total Amount:', `Rs. ${paymentSummary.totalAmount.toFixed(2)}`);
+    row('Total Amount:', `Rs. ${paymentSummary.totalAmount.toFixed(2)}`);
     if (paymentSummary.advanceAmount != null) {
-      paymentRow('Advance Amount:', `Rs. ${paymentSummary.advanceAmount.toFixed(2)}`);
+      row('Advance Amount:', `Rs. ${paymentSummary.advanceAmount.toFixed(2)}`);
     }
-    paymentRow('Paid Amount:', `Rs. ${paymentSummary.paidAmount.toFixed(2)}`);
-    paymentRow('Remaining Amount:', `Rs. ${paymentSummary.remainingAmount.toFixed(2)}`);
-    if (paymentSummary.status) paymentRow('Payment Status:', paymentSummary.status);
-    if (paymentSummary.method) paymentRow('Payment Method:', paymentSummary.method);
-    if (paymentSummary.transactionId) paymentRow('Transaction ID:', paymentSummary.transactionId);
-    if (paymentSummary.paidAt) paymentRow('Payment Date:', new Date(paymentSummary.paidAt).toLocaleDateString('en-IN'));
+    row('Paid Amount:', `Rs. ${paymentSummary.paidAmount.toFixed(2)}`);
+    row('Remaining Amount:', `Rs. ${paymentSummary.remainingAmount.toFixed(2)}`);
+    row('Payment Status:', paymentSummary.paymentStatus);
+
+    y += 10;
+    doc.moveTo(40, y).lineTo(555, y).stroke();
+    y += 14;
+    doc.font('Helvetica-Bold').fontSize(11).text('PAYMENT DETAILS', 40, y);
+    y += 18;
+    if (paymentSummary.method) row('Payment Method:', paymentSummary.method);
+    if (paymentSummary.paidAt) row('Payment Date:', new Date(paymentSummary.paidAt).toLocaleDateString('en-IN'));
+    if (paymentSummary.transactionId) row('Transaction ID:', paymentSummary.transactionId);
+    if (!paymentSummary.method && !paymentSummary.paidAt && !paymentSummary.transactionId) {
+      doc.font('Helvetica').fontSize(10).text('No payment recorded yet.', 40, y);
+    }
 
     const done = new Promise<Buffer>((resolve, reject) => {
       doc.on('end', () => resolve(Buffer.concat(chunks)));
