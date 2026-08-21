@@ -81,6 +81,12 @@ async function bootstrap() {
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
+    // Content-Disposition/Content-Length aren't on the browser's default CORS-safelisted
+    // response headers — without this, a Web frontend reading response.headers.get(
+    // 'Content-Disposition') (e.g. to name the downloaded invoice PDF file) gets null on any
+    // cross-origin request, even though the PDF body itself still downloads fine. Relevant to
+    // GET invoicing/invoices/:id/pdf specifically, which sets both.
+    exposedHeaders: ['Content-Disposition', 'Content-Length'],
     credentials: true,
   });
 

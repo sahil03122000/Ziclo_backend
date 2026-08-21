@@ -24,9 +24,18 @@ class EnvironmentVariables {
   @IsString()
   JWT_EXPIRES_IN: string = '15m';
 
+  // No default here on purpose — @nestjs/config's `validate` step writes this validated
+  // instance's values back onto process.env, so a class-level default here would silently
+  // override main.ts's own `(process.env.CORS_ORIGIN || '*')` fallback with a single fixed
+  // origin no matter what. That's exactly what was happening: CORS_ORIGIN was never set in any
+  // .env file, yet process.env.CORS_ORIGIN resolved to "http://localhost:3000" at runtime
+  // (confirmed live), silently rejecting every other origin — including a real Web frontend
+  // running on any other host/port — with a 500, despite main.ts's own comment stating intent
+  // ("Default to '*' so mobile devices on the LAN are never blocked during dev"). Leaving this
+  // undefined when unset lets that existing fallback actually take effect as designed.
   @IsOptional()
   @IsString()
-  CORS_ORIGIN: string = 'http://localhost:3000';
+  CORS_ORIGIN?: string;
 
   @IsOptional()
   @IsString()
