@@ -123,92 +123,237 @@ async function bootstrap() {
 
   // ─── Swagger / OpenAPI ──────────────────────────────────────────────────────
   const swaggerConfig = new DocumentBuilder()
-    .setTitle('Ziclo Enterprise API')
-    .setDescription(
-      '## Enterprise Field-Service Management Platform\n\n' +
-      '### Authentication\n' +
-      '1. Use **`POST /api/v1/auth/firebase-login`** (recommended — Firebase Phone Auth) or\n' +
-      '   **`POST /api/v1/auth/login`** (email + password, admin/manager only)\n' +
-      '2. Copy the `accessToken` from the response\n' +
-      '3. Click **Authorize** above and enter `Bearer <token>`\n\n' +
-      '### Roles\n' +
-      '| Role | Description |\n' +
-      '|------|-------------|\n' +
-      '| `SUPER_ADMIN` | Platform owner — manages orgs, plans, overrides |\n' +
-      '| `ADMIN` | Organization admin — manages all org resources |\n' +
-      '| `MANAGER` | Manages workers, reviews tasks, confirms bookings |\n' +
-      '| `WORKER` | Field staff — executes tasks, checks in/out |\n' +
-      '| `USER` | End customer — creates bookings, views invoices |\n\n' +
-      '### Response Envelope\n' +
-      'All responses are wrapped: `{ success: boolean, data: T, message?: string }`\n\n' +
-      '### Rate Limiting\n' +
-      'Default: 100 req/min per IP. Auth endpoints: 10 req/min. OTP: 5 req/min.',
-    )
-    .setVersion('2.0.0')
-    .setContact('Ziclo Support', '', 'support@ziclo.in')
-    .addServer('http://192.168.1.9:3000', 'LAN')
-    .addServer('http://localhost:3000', 'Local')
-    .addServer('http://api.ziclo.in', 'Production')
-    .addServer(process.env.BASE_URL || `http://localhost:${process.env.PORT || 3000}`, 'Local / LAN')
-    .addServer('http://api.ziclo.in', 'Production')
-    .addBearerAuth(
-      { type: 'http', scheme: 'bearer', bearerFormat: 'JWT', description: 'JWT access token from /auth/login or /auth/firebase-login' },
-      'JWT',
-    )
-    // ── Authentication ──────────────────────────────────────────────────────
-    .addTag('Authentication', 'Firebase phone login, email+password login, token refresh, password management, session management')
-    // ── Users & Addresses ───────────────────────────────────────────────────
-    .addTag('Users', 'User profile, role assignment, status management, CSV export')
-    .addTag('Addresses', 'Saved delivery/service addresses with GPS coordinates, default management')
-    // ── Field Operations ────────────────────────────────────────────────────
-    .addTag('Attendance', 'GPS + selfie check-in/check-out, monthly summary, admin corrections')
-    .addTag('Tasks', 'Full task lifecycle — create, assign, start, complete, approve, reject')
-    .addTag('Areas', 'Geographic service area management and manager assignments')
-    .addTag('Pincodes', 'Pincode management, manager and worker pincode assignments')
-    .addTag('Office Locations', 'Geofenced office locations for check-in radius enforcement')
-    // ── Booking Engine ──────────────────────────────────────────────────────
-    .addTag('Booking / Services', 'Service catalogue — slug, booking type, payment type, dynamic flow endpoints')
-    .addTag('Booking / Time Slots', 'Slot capacity and availability window management')
-    .addTag('Booking / Bookings', 'Full booking lifecycle — create with step values, preview pricing, assign, reschedule, cancel, complete')
-    .addTag('Booking / Config', 'Customer-facing booking configuration — tax %, advance payment %, active service areas, service-area check')
-    // ── Admin Catalog ───────────────────────────────────────────────────────
-    .addTag('Admin / Staff', 'Manager and worker listings with real-time attendance, work status, office location, and area assignment — ADMIN only')
-    .addTag('Admin / Catalog', 'Dynamic service configuration — categories, services, booking steps, options, packages, add-ons, pricing rules, conditional rules, payment rules')
-    // ── Invoicing & Payments ────────────────────────────────────────────────
-    .addTag('Invoicing / Invoices', 'Auto-generation from bookings, manual invoices, GST, line items, PDF metadata, status lifecycle')
-    .addTag('Invoicing / Payments', 'Razorpay order creation + signature verification, offline payments (cash/card/UPI), refunds')
-    // ── CRM ─────────────────────────────────────────────────────────────────
-    .addTag('CRM', 'Pipeline overview and CRM dashboard — lead funnel, deal forecast')
-    .addTag('CRM / Customers', 'Customer CRUD with contact associations and booking history')
-    .addTag('CRM / Leads', 'Lead pipeline — NEW → CONTACTED → QUALIFIED → PROPOSAL_SENT → WON/LOST — includes conversion to Customer')
-    .addTag('CRM / Deals', 'Deal management with stage tracking and value forecast')
-    .addTag('CRM / Contacts', 'Contact management linked to customers')
-    .addTag('CRM / Activities', 'Activity log — calls, emails, meetings, notes, tasks')
-    // ── Notifications & Uploads ─────────────────────────────────────────────
-    .addTag('Banners', 'Home screen banner management — create, update, reorder, activate/deactivate, soft-delete (Admin); public active banners list')
-    .addTag('Notifications', 'FCM device token registration, in-app notification inbox, bulk push dispatch')
-    .addTag('Uploads', 'Multipart image upload (JPG/PNG/WebP, 10 MB max) to local storage by folder')
-    // ── Intelligence ────────────────────────────────────────────────────────
-    .addTag('Dashboard', 'Role-specific aggregated stats — Admin, Manager, Worker, Super-Admin (cached 60 s)')
-    .addTag('Reports', 'Task, attendance, revenue, booking and CRM pipeline reports with CSV export')
-    .addTag('Analytics', 'Time-series analytics — weekly / monthly / yearly trends')
-    .addTag('Audit Logs', 'Immutable audit trail of all mutations with actor, entity, before/after values')
-    .addTag('Admin / Activity Log', 'Human-readable activity timeline — paginated log, per-entry detail, dashboard feed, today\'s stats')
-    .addTag('Settings', 'System settings key-value store — ADMIN only')
-    .addTag('Health', 'Liveness and readiness probes with DB latency and memory metrics')
-    // ── Tenancy & Plans ─────────────────────────────────────────────────────
-    .addTag('Plans', 'Subscription plan catalogue — name, price, feature limits — SUPER_ADMIN managed')
-    .addTag('Organizations', 'Tenant CRUD — create, dashboard, update, delete')
-    .addTag('Organization Members', 'Invite, role update, soft-remove organization members')
-    .addTag('Organization Subscriptions', 'TRIAL → PAID upgrade, plan change, cancel, renew, invoice history')
-    .addTag('Super Admin', 'Platform-level operations — org status, subscription override, hard delete, cross-org user list')
-    // ── Support & Webhooks ──────────────────────────────────────────────────
-    .addTag('Support', 'Support ticket lifecycle — create, comment, attach, assign, escalate, resolve, close')
-    .addTag('Webhooks', 'Razorpay event callbacks — payment captured/failed, order paid, refund processed, subscription events')
-    .addTag('Website', 'Public marketing website content — settings, home, statistics, SEO (Module 1)')
-    .addTag('Website / Services', 'Public marketing website catalogue — categories, services, property types, packages, pricing options (Module 2). Separate from the Mobile App\'s authenticated booking-flow endpoints.')
-    .addTag('Website / Content', 'Public marketing website content — banners, gallery, why-Ziclo, app showcase, download links, testimonials, FAQ (Module 3)')
-    .build();
+  .setTitle('Ziclo Enterprise API')
+  .setDescription(
+    '## Enterprise Field-Service Management Platform\n\n' +
+    '### Authentication\n' +
+    '1. Use **`POST /api/v1/auth/firebase-login`** (recommended — Firebase Phone Auth) or\n' +
+    '   **`POST /api/v1/auth/login`** (email + password, admin/manager only)\n' +
+    '2. Copy the `accessToken` from the response\n' +
+    '3. Click **Authorize** above and enter `Bearer <token>`\n\n' +
+    '### Roles\n' +
+    '| Role | Description |\n' +
+    '|------|-------------|\n' +
+    '| `SUPER_ADMIN` | Platform owner — manages orgs, plans, overrides |\n' +
+    '| `ADMIN` | Organization admin — manages all org resources |\n' +
+    '| `MANAGER` | Manages workers, reviews tasks, confirms bookings |\n' +
+    '| `WORKER` | Field staff — executes tasks, checks in/out |\n' +
+    '| `USER` | End customer — creates bookings, views invoices |\n\n' +
+    '### Response Envelope\n' +
+    'All responses are wrapped: `{ success: boolean, data: T, message?: string }`\n\n' +
+    '### Rate Limiting\n' +
+    'Default: 100 req/min per IP. Auth endpoints: 10 req/min. OTP: 5 req/min.',
+  )
+  .setVersion('2.0.0')
+  .setContact('Ziclo Support', '', 'support@ziclo.in')
+
+  // Use BASE_URL so Swagger automatically uses Render in production
+  .addServer(
+    process.env.BASE_URL || `http://localhost:${process.env.PORT || 3000}`,
+    'Current Server',
+  )
+
+  .addBearerAuth(
+    {
+      type: 'http',
+      scheme: 'bearer',
+      bearerFormat: 'JWT',
+      description:
+        'JWT access token from /auth/login or /auth/firebase-login',
+    },
+    'JWT',
+  )
+
+  // ── Authentication ──────────────────────────────────────────────────────
+  .addTag(
+    'Authentication',
+    'Firebase phone login, email+password login, token refresh, password management, session management',
+  )
+
+  // ── Users & Addresses ───────────────────────────────────────────────────
+  .addTag(
+    'Users',
+    'User profile, role assignment, status management, CSV export',
+  )
+  .addTag(
+    'Addresses',
+    'Saved delivery/service addresses with GPS coordinates, default management',
+  )
+
+  // ── Field Operations ────────────────────────────────────────────────────
+  .addTag(
+    'Attendance',
+    'GPS + selfie check-in/check-out, monthly summary, admin corrections',
+  )
+  .addTag(
+    'Tasks',
+    'Full task lifecycle — create, assign, start, complete, approve, reject',
+  )
+  .addTag(
+    'Areas',
+    'Geographic service area management and manager assignments',
+  )
+  .addTag(
+    'Pincodes',
+    'Pincode management, manager and worker pincode assignments',
+  )
+  .addTag(
+    'Office Locations',
+    'Geofenced office locations for check-in radius enforcement',
+  )
+
+  // ── Booking Engine ──────────────────────────────────────────────────────
+  .addTag(
+    'Booking / Services',
+    'Service catalogue — slug, booking type, payment type, dynamic flow endpoints',
+  )
+  .addTag(
+    'Booking / Time Slots',
+    'Slot capacity and availability window management',
+  )
+  .addTag(
+    'Booking / Bookings',
+    'Full booking lifecycle — create with step values, preview pricing, assign, reschedule, cancel, complete',
+  )
+  .addTag(
+    'Booking / Config',
+    'Customer-facing booking configuration — tax %, advance payment %, active service areas, service-area check',
+  )
+
+  // ── Admin Catalog ───────────────────────────────────────────────────────
+  .addTag(
+    'Admin / Staff',
+    'Manager and worker listings with real-time attendance, work status, office location, and area assignment — ADMIN only',
+  )
+  .addTag(
+    'Admin / Catalog',
+    'Dynamic service configuration — categories, services, booking steps, options, packages, add-ons, pricing rules, conditional rules, payment rules',
+  )
+
+  // ── Invoicing & Payments ────────────────────────────────────────────────
+  .addTag(
+    'Invoicing / Invoices',
+    'Auto-generation from bookings, manual invoices, GST, line items, PDF metadata, status lifecycle',
+  )
+  .addTag(
+    'Invoicing / Payments',
+    'Razorpay order creation + signature verification, offline payments (cash/card/UPI), refunds',
+  )
+
+  // ── CRM ─────────────────────────────────────────────────────────────────
+  .addTag(
+    'CRM',
+    'Pipeline overview and CRM dashboard — lead funnel, deal forecast',
+  )
+  .addTag(
+    'CRM / Customers',
+    'Customer CRUD with contact associations and booking history',
+  )
+  .addTag(
+    'CRM / Leads',
+    'Lead pipeline — NEW → CONTACTED → QUALIFIED → PROPOSAL_SENT → WON/LOST — includes conversion to Customer',
+  )
+  .addTag(
+    'CRM / Deals',
+    'Deal management with stage tracking and value forecast',
+  )
+  .addTag(
+    'CRM / Contacts',
+    'Contact management linked to customers',
+  )
+  .addTag(
+    'CRM / Activities',
+    'Activity log — calls, emails, meetings, notes, tasks',
+  )
+
+  // ── Notifications & Uploads ─────────────────────────────────────────────
+  .addTag(
+    'Banners',
+    'Home screen banner management — create, update, reorder, activate/deactivate, soft-delete (Admin); public active banners list',
+  )
+  .addTag(
+    'Notifications',
+    'FCM device token registration, in-app notification inbox, bulk push dispatch',
+  )
+  .addTag(
+    'Uploads',
+    'Multipart image upload (JPG/PNG/WebP, 10 MB max) to local storage by folder',
+  )
+
+  // ── Intelligence ────────────────────────────────────────────────────────
+  .addTag(
+    'Dashboard',
+    'Role-specific aggregated stats — Admin, Manager, Worker, Super-Admin (cached 60 s)',
+  )
+  .addTag(
+    'Reports',
+    'Task, attendance, revenue, booking and CRM pipeline reports with CSV export',
+  )
+  .addTag(
+    'Analytics',
+    'Time-series analytics — weekly / monthly / yearly trends',
+  )
+  .addTag(
+    'Audit Logs',
+    'Immutable audit trail of all mutations with actor, entity, before/after values',
+  )
+  .addTag(
+    'Admin / Activity Log',
+    "Human-readable activity timeline — paginated log, per-entry detail, dashboard feed, today's stats",
+  )
+  .addTag(
+    'Settings',
+    'System settings key-value store — ADMIN only',
+  )
+  .addTag(
+    'Health',
+    'Liveness and readiness probes with DB latency and memory metrics',
+  )
+
+  // ── Tenancy & Plans ─────────────────────────────────────────────────────
+  .addTag(
+    'Plans',
+    'Subscription plan catalogue — name, price, feature limits — SUPER_ADMIN managed',
+  )
+  .addTag(
+    'Organizations',
+    'Tenant CRUD — create, dashboard, update, delete',
+  )
+  .addTag(
+    'Organization Members',
+    'Invite, role update, soft-remove organization members',
+  )
+  .addTag(
+    'Organization Subscriptions',
+    'TRIAL → PAID upgrade, plan change, cancel, renew, invoice history',
+  )
+  .addTag(
+    'Super Admin',
+    'Platform-level operations — org status, subscription override, hard delete, cross-org user list',
+  )
+
+  // ── Support & Webhooks ──────────────────────────────────────────────────
+  .addTag(
+    'Support',
+    'Support ticket lifecycle — create, comment, attach, assign, escalate, resolve, close',
+  )
+  .addTag(
+    'Webhooks',
+    'Razorpay event callbacks — payment captured/failed, order paid, refund processed, subscription events',
+  )
+  .addTag(
+    'Website',
+    'Public marketing website content — settings, home, statistics, SEO (Module 1)',
+  )
+  .addTag(
+    'Website / Services',
+    "Public marketing website catalogue — categories, services, property types, packages, pricing options (Module 2). Separate from the Mobile App's authenticated booking-flow endpoints.",
+  )
+  .addTag(
+    'Website / Content',
+    'Public marketing website content — banners, gallery, why-Ziclo, app showcase, download links, testimonials, FAQ (Module 3)',
+  )
+  .build();
 
   const document = SwaggerModule.createDocument(app, swaggerConfig);
 
