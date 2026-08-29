@@ -5,13 +5,14 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { ActivityAction, ActivityModule, AuditAction, Booking, BookingStatus, NotificationType, PaymentMethod, PaymentStatus, PaymentType, Prisma, Role, TaskPhotoType } from '@prisma/client';
+import { ActivityAction, ActivityModule, AttendanceStatus, AuditAction, Booking, BookingStatus, LeaveRequestStatus, NotificationType, PaymentMethod, PaymentStatus, PaymentType, Prisma, Role, TaskPhotoType } from '@prisma/client';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
 
 import { ActivityLogService } from '../../activity-log/activity-log.service';
 import { DEFAULTS, SETTING_KEYS } from '../../admin/admin.service';
 import { AuditLogsService } from '../../audit-logs/audit-logs.service';
 import type { AuthUser } from '../../common/types/auth-user.type';
+import { getTodayRange } from '../../common/utils/date.util';
 import { EmailService } from '../../email/email.service';
 import { InvoicesService } from '../../invoicing/invoices/invoices.service';
 import { PaymentsService } from '../../invoicing/payments/payments.service';
@@ -840,6 +841,11 @@ export class BookingsService {
     if (!worker || worker.role !== Role.WORKER) throw new BadRequestException('Assigned user is not a valid worker');
     if (!worker.isActive) throw new BadRequestException('Worker account is inactive');
 
+    // Re-checked at the exact moment of assignment (not earlier, e.g. when the manager's
+    // assignment screen was opened) — a worker who checks out between screen-open and the
+    // manager pressing "Assign" must still be blocked here.
+    await this.assertWorkerOnDuty(dto.workerId);
+
     const updated = await this.prisma.booking.update({
       where: { id },
       data: { workerId: dto.workerId, status: BookingStatus.ASSIGNED },
@@ -1398,6 +1404,37 @@ export class BookingsService {
 
   private assertOwner(booking: { customerId: string }, userId: string): void {
     if (booking.customerId !== userId) throw new ForbiddenException('This booking does not belong to you');
+  }
+
+  // Business rule: a job can only be assigned to a Worker who is currently on duty — active,
+  // not on approved leave today, and has a currently-OPEN check-in session for TODAY (checking
+  // in then checking out still blocks assignment; an open session from a previous day does not
+  // count — see getTodayRange). Reuses the exact same "open session for today" query
+  // AttendanceService already uses everywhere else (attendance.service.ts) rather than
+  // inventing a second attendance-status system; duplicated here (not injected) because
+  // BookingsModule doesn't import AttendanceModule — same reasoning as
+  // TasksService.assertWorkerOnDuty, kept identical to it.
+  private async assertWorkerOnDuty(workerId: string): Promise<void> {
+    const NOT_ON_DUTY_MESSAGE = 'Worker is not checked in. Task cannot be assigned until the worker checks in.';
+
+    const { start, end } = getTodayRange();
+
+    // Same exact-match convention leave-request.service.ts's own duplicate-date check already
+    // uses (WorkerLeaveRequest.date is stored as new Date(dateOnlyString), i.e. UTC midnight of
+    // that calendar date) — not getTodayRange's local-time window, which is specific to
+    // Attendance.checkInTime (a true timestamp), a different field with different semantics.
+    const todayDateOnly = new Date(new Date().toISOString().split('T')[0]);
+    const onApprovedLeave = await this.prisma.workerLeaveRequest.findFirst({
+      where: { workerId, status: LeaveRequestStatus.APPROVED, date: todayDateOnly },
+      select: { id: true },
+    });
+    if (onApprovedLeave) throw new BadRequestException(NOT_ON_DUTY_MESSAGE);
+
+    const openSession = await this.prisma.attendance.findFirst({
+      where: { userId: workerId, checkInTime: { gte: start, lt: end }, status: AttendanceStatus.CHECKED_IN },
+      select: { id: true },
+    });
+    if (!openSession) throw new BadRequestException(NOT_ON_DUTY_MESSAGE);
   }
 
   private async recordStatusHistory(

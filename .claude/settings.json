@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/sahil/AppData/Local/Temp/claude/d--eservices-backend/1284f663-a786-470d-a5bb-0a6ab2bf4d32/scratchpad/**)",
+      "Bash(curl -s -X POST http://localhost:3000/api/v1/bookings/c76a0baa-948d-4193-b334-d2f8b2eb5ff8/assign-worker -H 'Authorization: Bearer __CMDSUB_OUTPUT__' -H 'Content-Type: application/json' -d '{\"workerId\":\"3aebe57c-0e33-4683-9b1e-b39ef2a3cdcf\"}')",
+      "Bash(node -e ' *)"
+    ]
+  }
+}

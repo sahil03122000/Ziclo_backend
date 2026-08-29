@@ -4,9 +4,10 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { AuditAction, Prisma, Role, Task, TaskPhotoType, TaskStatus } from '@prisma/client';
+import { AttendanceStatus, AuditAction, LeaveRequestStatus, Prisma, Role, Task, TaskPhotoType, TaskStatus } from '@prisma/client';
 
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
+import { getTodayRange } from '../common/utils/date.util';
 import { NotificationsService } from '../notifications/notifications.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AssignWorkerDto } from './dto/assign-worker.dto';
@@ -229,6 +230,11 @@ export class TasksService {
       await this.validateWorkerForPincode(dto.workerId, task.pincodeId);
       await this.validateWorkerInManagerPincodes(dto.workerId, managerId);
     }
+
+    // Re-checked at the exact moment of assignment (not earlier, e.g. when the manager's
+    // assignment screen was opened) — a worker who checks out between screen-open and the
+    // manager pressing "Assign" must still be blocked here.
+    await this.assertWorkerOnDuty(dto.workerId);
 
     const updated = await this.prisma.task.update({
       where: { id: taskId },
@@ -486,5 +492,43 @@ export class TasksService {
     if (!workerPincodeId || !managerPincodeIds.includes(workerPincodeId)) {
       throw new ForbiddenException('Worker does not belong to your pincode area');
     }
+  }
+
+  // Business rule: a task can only be assigned to a Worker who is currently on duty — active,
+  // not on approved leave today, and has a currently-OPEN check-in session for TODAY (checking
+  // in then checking out still blocks assignment; an open session from a previous day does not
+  // count — see getTodayRange). Reuses the exact same "open session for today" query
+  // AttendanceService already uses everywhere else (attendance.service.ts) rather than
+  // inventing a second attendance-status system; duplicated here (not injected) because
+  // AttendanceModule isn't wired into TasksModule and importing it would need to be checked
+  // for circularity — this is a handful of direct Prisma reads against the same existing
+  // tables, not a new one.
+  private async assertWorkerOnDuty(workerId: string): Promise<void> {
+    const NOT_ON_DUTY_MESSAGE = 'Worker is not checked in. Task cannot be assigned until the worker checks in.';
+
+    const worker = await this.prisma.user.findUnique({
+      where: { id: workerId },
+      select: { isActive: true },
+    });
+    if (!worker || !worker.isActive) throw new BadRequestException(NOT_ON_DUTY_MESSAGE);
+
+    const { start, end } = getTodayRange();
+
+    // Same exact-match convention leave-request.service.ts's own duplicate-date check already
+    // uses (WorkerLeaveRequest.date is stored as new Date(dateOnlyString), i.e. UTC midnight of
+    // that calendar date) — not getTodayRange's local-time window, which is specific to
+    // Attendance.checkInTime (a true timestamp), a different field with different semantics.
+    const todayDateOnly = new Date(new Date().toISOString().split('T')[0]);
+    const onApprovedLeave = await this.prisma.workerLeaveRequest.findFirst({
+      where: { workerId, status: LeaveRequestStatus.APPROVED, date: todayDateOnly },
+      select: { id: true },
+    });
+    if (onApprovedLeave) throw new BadRequestException(NOT_ON_DUTY_MESSAGE);
+
+    const openSession = await this.prisma.attendance.findFirst({
+      where: { userId: workerId, checkInTime: { gte: start, lt: end }, status: AttendanceStatus.CHECKED_IN },
+      select: { id: true },
+    });
+    if (!openSession) throw new BadRequestException(NOT_ON_DUTY_MESSAGE);
   }
 }
