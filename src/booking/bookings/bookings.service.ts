@@ -931,6 +931,18 @@ export class BookingsService {
       throw new BadRequestException(`Cannot complete a booking in ${booking.status} state`);
     }
 
+    // Service must not be completable while money is still owed — checkout being opened is
+    // not payment; only a backend-verified Razorpay SUCCESS (or the worker's in-person cash/QR
+    // collection) counts. Same remaining-amount derivation getSummary() uses (sum of this
+    // booking's SUCCESS payments, or the full total if paymentCollectedAt is set) — never a
+    // second calculation.
+    const remaining = await this.getRemainingAmount(id);
+    if (remaining > 0) {
+      throw new BadRequestException(
+        `Cannot complete booking: outstanding payment of Rs. ${remaining} has not been received. Collect the remaining payment before completing.`,
+      );
+    }
+
     const updated = await this.prisma.booking.update({
       where: { id },
       data: { status: BookingStatus.COMPLETED, completedAt: new Date() },
@@ -1139,7 +1151,14 @@ export class BookingsService {
       this.logger.debug(`[razorpay-order] booking lookup END (+${Date.now() - t0}ms) status=${booking.status}`);
 
       this.assertOwner(booking, customerId);
-      if (booking.status !== BookingStatus.PENDING_PAYMENT) {
+      // PENDING_PAYMENT (original case, paying the advance/full amount at booking time) is
+      // always payable. Any other NON-terminal status is also payable — this is what makes
+      // collecting the REMAINING balance later (after the advance has already been paid and
+      // the booking has moved on to PENDING/CONFIRMED/ASSIGNED/IN_PROGRESS) possible at all;
+      // previously this status gate hard-blocked it, the only way to collect the remainder was
+      // the Worker's cash/QR collectPayment() (no real Razorpay flow, no amount tracked). A
+      // booking that's already COMPLETED/CANCELLED/NO_SHOW has nothing left to pay for.
+      if (booking.status !== BookingStatus.PENDING_PAYMENT && TERMINAL_STATUSES.includes(booking.status)) {
         throw new BadRequestException('This booking is not awaiting payment');
       }
 
@@ -1404,6 +1423,31 @@ export class BookingsService {
 
   private assertOwner(booking: { customerId: string }, userId: string): void {
     if (booking.customerId !== userId) throw new ForbiddenException('This booking does not belong to you');
+  }
+
+  // Same paidAmount/remainingAmount derivation getSummary() already uses — never advanceAmount,
+  // never the raw (possibly stale after a second payment attempt) Booking.paidAmount column.
+  // paidAmount is the live sum of this booking's invoice's SUCCESS payments (correctly includes
+  // BOTH the advance and any later remaining-balance payment, each its own Payment row), or the
+  // full total if the worker's in-person cash/QR collection settled it.
+  private async getRemainingAmount(bookingId: string): Promise<number> {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      select: {
+        totalAmount: true,
+        paidAmount: true,
+        paymentCollectedAt: true,
+        invoice: { select: { payments: { where: { status: PaymentStatus.SUCCESS }, select: { amount: true } } } },
+      },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+
+    const totalAmount = r0(booking.totalAmount ?? 0);
+    const onlinePaid = booking.invoice
+      ? r2(booking.invoice.payments.reduce((sum, p) => sum + p.amount, 0))
+      : (booking.paidAmount ?? 0);
+    const paidAmount = booking.paymentCollectedAt ? totalAmount : r0(onlinePaid);
+    return Math.max(0, totalAmount - paidAmount);
   }
 
   // Business rule: a job can only be assigned to a Worker who is currently on duty — active,

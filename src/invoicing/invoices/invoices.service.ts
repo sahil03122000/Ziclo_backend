@@ -251,14 +251,38 @@ export class InvoicesService {
       }
 
       const hasSuccessfulPayment = existing.payments.some((p) => p.status === PaymentStatus.SUCCESS);
-      if (hasSuccessfulPayment || !MUTABLE_STATUSES.includes(existing.status)) {
+      // Root cause of "no way to collect the remaining balance via Razorpay after the advance
+      // is paid": this used to unconditionally block ANY mismatched total once a payment had
+      // succeeded. Growing ADVANCE -> FULL (i.e. requesting the larger, full-booking total) is
+      // now the one case that's still allowed even with a successful payment already recorded
+      // — it's how the remainder gets collected: the SAME invoice's total grows to the full
+      // booking amount, the existing successful Payment/Transaction rows are left completely
+      // untouched, and PaymentsService.createRazorpayOrder's own `outstanding = invoice.total -
+      // invoice.paidAmount` (paidAmount = live sum of this invoice's SUCCESS payments) then
+      // naturally comes out to exactly the remaining amount — zero changes needed there, and no
+      // second invoice/Razorpay integration created. Shrinking, or any other mismatch, stays
+      // blocked exactly as before.
+      const isGrowingToFullAfterPayment =
+        hasSuccessfulPayment && paymentType === PaymentType.FULL && r2(taxes.total) > r2(existing.total);
+      if (hasSuccessfulPayment && !isGrowingToFullAfterPayment) {
+        throw new BadRequestException('Invoice already has payments; cannot switch payment type');
+      }
+      if (!hasSuccessfulPayment && !MUTABLE_STATUSES.includes(existing.status)) {
         throw new BadRequestException('Invoice already has payments; cannot switch payment type');
       }
 
       await this.prisma.invoiceItem.deleteMany({ where: { invoiceId: existing.id } });
       const updated = await this.prisma.invoice.update({
         where: { id: existing.id },
-        data: { ...taxes, items: { create: items } },
+        data: {
+          ...taxes,
+          items: { create: items },
+          // Growing the total past what's already been paid means the invoice can no longer
+          // be fully PAID (that's precisely why we're here) — correct it to PARTIALLY_PAID
+          // immediately rather than leaving the stale PAID status on the row until the new
+          // payment's own verifyRazorpay -> syncPaymentStatus call eventually re-syncs it.
+          ...(isGrowingToFullAfterPayment ? { status: InvoiceStatus.PARTIALLY_PAID } : {}),
+        },
         select: INVOICE_PAYMENT_ORDER_SELECT,
       });
       this.logger.debug(`[razorpay-order] invoice END (+${Date.now() - t0}ms) rebuilt invoiceId=${updated.id}`);
@@ -893,12 +917,25 @@ export class InvoicesService {
     const chunks: Buffer[] = [];
     doc.on('data', (chunk: Buffer) => chunks.push(chunk));
 
-    doc.rect(0, 0, doc.page.width, 70).fill('#1F4E79');
-    doc.fill('white').fontSize(20).font('Helvetica-Bold').text('INVOICE', 40, 18, { lineBreak: false });
-    doc.fontSize(10).font('Helvetica').text('Ziclo — Tax Invoice', 40, 42, { lineBreak: false });
+    // ─── Branded header ───────────────────────────────────────────────────────
+    // No Ziclo logo image asset exists anywhere in this repo (checked uploads/, a possible
+    // assets/ folder, and WebsiteSettings.logoUrl — the WebsiteSettings row itself doesn't even
+    // exist in the database yet) — embedding a placeholder graphic here would be inventing a
+    // detail the project hasn't actually supplied, so the brand mark stays typographic (the
+    // same "Ziclo" wordmark styling already used, text-only, in EmailService's templates)
+    // rather than a fabricated image. Only support@ziclo.in is printed as contact info — it's
+    // the one business detail actually verified elsewhere in this codebase (EmailService,
+    // Swagger contact in main.ts); no address/phone/GSTIN/website are configured anywhere in
+    // the project, so none are shown rather than making them up.
+    const headerHeight = 80;
+    doc.rect(0, 0, doc.page.width, headerHeight).fill('#1F4E79');
+    doc.fill('white');
+    doc.font('Helvetica-Bold').fontSize(26).text('ZICLO', 40, 20, { lineBreak: false });
+    doc.font('Helvetica').fontSize(9).text('Home Services, Simplified', 40, 50, { lineBreak: false });
+    doc.font('Helvetica-Bold').fontSize(14).text('TAX INVOICE', 40, 22, { width: doc.page.width - 80, align: 'right', lineBreak: false });
+    doc.font('Helvetica').fontSize(9).text('support@ziclo.in', 40, 50, { width: doc.page.width - 80, align: 'right', lineBreak: false });
     doc.fill('#000000');
-
-    doc.moveDown(3);
+    doc.y = headerHeight + 24;
     doc.font('Helvetica-Bold').fontSize(10).text('Invoice Number: ', { continued: true }).font('Helvetica').text(invoice.invoiceNumber);
     doc.font('Helvetica-Bold').text('Invoice Date: ', { continued: true }).font('Helvetica').text(invoice.createdAt.toLocaleDateString('en-IN'));
 
@@ -997,6 +1034,17 @@ export class InvoicesService {
     if (!paymentSummary.method && !paymentSummary.paidAt && !paymentSummary.transactionId) {
       doc.font('Helvetica').fontSize(10).text('No payment recorded yet.', 40, y);
     }
+
+    // ─── Branded footer ──────────────────────────────────────────────────────
+    // Placed a fixed gap below whatever content ended above (doc.y, not the manually-tracked
+    // `y`, so it's correct even on the "No payment recorded yet" branch, which doesn't advance
+    // `y`) — same reasoning as the header on what contact info is safe to print: only the
+    // already-verified support@ziclo.in.
+    const footerY = doc.y + 30;
+    doc.moveTo(40, footerY).lineTo(555, footerY).strokeColor('#CCCCCC').stroke().strokeColor('#000000');
+    doc.font('Helvetica-Bold').fontSize(9).fillColor('#1F4E79').text('Thank you for choosing Ziclo!', 40, footerY + 10, { width: doc.page.width - 80, align: 'center' });
+    doc.font('Helvetica').fontSize(8).fillColor('#666666').text('For any queries regarding this invoice, contact support@ziclo.in', 40, doc.y + 2, { width: doc.page.width - 80, align: 'center' });
+    doc.fillColor('#000000');
 
     const done = new Promise<Buffer>((resolve, reject) => {
       doc.on('end', () => resolve(Buffer.concat(chunks)));
