@@ -51,6 +51,10 @@ const BOOKING_INCLUDE = {
   manager:      { select: BOOKING_USER_SELECT },
   createdBy:    { select: BOOKING_USER_SELECT },
   photos:       { orderBy: { createdAt: 'asc' as const } },
+  // Needed so toWorkerJobDto() can report the ACTUAL amount paid so far (see
+  // computeActualPaidAmount below) — never booking.advanceAmount, which is only the
+  // quoted/expected advance and is not a record of what was actually, verifiably paid.
+  invoice:      { select: { payments: { where: { status: PaymentStatus.SUCCESS }, select: { amount: true } } } },
 } satisfies Prisma.BookingInclude;
 
 // Payment method as the Worker Panel UI knows it ('qr' | 'cash') — the app only ever
@@ -158,6 +162,27 @@ function formatSlotTime(timeSlot: WorkerJobBooking['timeSlot']): string {
   return `${fmt(timeSlot.startTime)} - ${fmt(timeSlot.endTime)}`;
 }
 
+// Actual amount paid so far — the SAME derivation getRemainingAmount()/getSummary() already
+// use (sum of this booking's invoice's SUCCESS payments, or the full total if the worker's
+// in-person cash/QR collection already settled it). NEVER booking.advanceAmount — that's only
+// the quoted/expected advance, not a record of what was actually, verifiably paid. Root cause
+// of the Worker Panel "Payment amount mismatch" bug: toWorkerJobDto() used to report
+// advancePaid = booking.advanceAmount, so the Worker Panel's displayed "Balance Due" (and the
+// amount it expected the Razorpay order to be created for) could disagree with the real
+// outstanding balance createPaymentOrder() computes from actual Payment rows.
+function computeActualPaidAmount(booking: {
+  totalAmount: number | null;
+  paidAmount: number | null;
+  paymentCollectedAt: Date | null;
+  invoice: { payments: { amount: number }[] } | null;
+}): number {
+  const totalAmount = r0(booking.totalAmount ?? 0);
+  const onlinePaid = booking.invoice
+    ? r2(booking.invoice.payments.reduce((sum, p) => sum + p.amount, 0))
+    : (booking.paidAmount ?? 0);
+  return booking.paymentCollectedAt ? totalAmount : r0(onlinePaid);
+}
+
 function toWorkerJobDto(booking: WorkerJobBooking) {
   const beforePhoto = booking.photos.find((p) => p.type === TaskPhotoType.BEFORE) ?? null;
   const afterPhoto = booking.photos.find((p) => p.type === TaskPhotoType.AFTER) ?? null;
@@ -176,7 +201,7 @@ function toWorkerJobDto(booking: WorkerJobBooking) {
     scheduledDate: booking.scheduledAt.toISOString().split('T')[0],
     scheduledTime: formatSlotTime(booking.timeSlot),
     amount: booking.totalAmount ?? 0,
-    advancePaid: booking.advanceAmount ?? 0,
+    advancePaid: computeActualPaidAmount(booking),
     description: `${booking.package.name} — ${booking.propertyType.name}`,
     notes: booking.notes ?? '',
     startLocation:
@@ -1504,10 +1529,7 @@ export class BookingsService {
     if (!booking) throw new NotFoundException('Booking not found');
 
     const totalAmount = r0(booking.totalAmount ?? 0);
-    const onlinePaid = booking.invoice
-      ? r2(booking.invoice.payments.reduce((sum, p) => sum + p.amount, 0))
-      : (booking.paidAmount ?? 0);
-    const paidAmount = booking.paymentCollectedAt ? totalAmount : r0(onlinePaid);
+    const paidAmount = computeActualPaidAmount(booking);
     return Math.max(0, totalAmount - paidAmount);
   }
 

@@ -141,12 +141,18 @@ export class PaymentsService {
     // becomes the amount actually charged via Razorpay, so the order is never created for a
     // fractional amount like ₹470.82.
     const outstanding = r0(invoice.total - invoice.paidAmount);
-    this.logger.debug(`[razorpay-order] amount calculation END (+${Date.now() - t0}ms) outstanding=${outstanding}`);
-
-    if (outstanding <= 0) throw new BadRequestException('Invoice is already fully paid');
-
     const paymentType = dto.paymentType ?? PaymentType.FULL;
     const amountInPaise = outstanding * 100;
+    // Sanitized — never logs any Razorpay credential. Total/Already Paid/Remaining are the
+    // server-side authoritative figures (invoice.total, invoice.paidAmount — the live sum of
+    // this invoice's SUCCESS payments); the Razorpay order is always created for exactly the
+    // remaining amount, never a value supplied by the client.
+    this.logger.debug(
+      `[razorpay-order] amount calculation END (+${Date.now() - t0}ms) invoiceId=${dto.invoiceId} paymentType=${paymentType} ` +
+        `total=${r0(invoice.total)} alreadyPaid=${r0(invoice.paidAmount)} remaining=${outstanding} razorpayOrderPaise=${amountInPaise}`,
+    );
+
+    if (outstanding <= 0) throw new BadRequestException('Invoice is already fully paid');
 
     // Idempotency: reuse an existing pending Razorpay order for this exact invoice/paymentType/
     // amount instead of creating a new one. This is what makes the endpoint safe against the
@@ -349,14 +355,44 @@ export class PaymentsService {
       throw new BadRequestException('Payment signature verification failed. The payment could not be confirmed.');
     }
 
-    // FULL: payable = total, remaining = 0.
-    // ADVANCE: payable = rounded advance amount, remaining = total - payable (derived from
-    // the already-rounded payable, never independently rounded, so payable + remaining is
-    // always exactly totalAmount — no penny/rupee drift between the two).
-    const paymentType = payment.paymentType ?? PaymentType.FULL;
+    // Expected amount for THIS transaction is exactly what the order was created for
+    // (Payment.amount, written in createRazorpayOrderInternal from the server-computed
+    // outstanding balance — never re-derived here, and never taken from the frontend/request
+    // body, which carries no amount field at all). "Received" is Razorpay's own record of
+    // what the order it created was for (Transaction.amount, saved verbatim from the Razorpay
+    // order response at creation time) — Razorpay never issues a valid signature for a
+    // payment_id that isn't actually the completed payment against that exact order, so this
+    // comparison catches any drift between what we intended to charge and what actually got
+    // recorded, without trusting either the client or a second Razorpay API round trip.
+    const expectedAmount = r0(payment.amount);
+    const receivedAmount = r0(payment.transactions[0]?.amount ?? payment.amount);
     const totalAmount = r0(payment.invoice.booking?.totalAmount ?? payment.amount);
-    const advanceAmount = r0(payment.invoice.booking?.advanceAmount ?? totalAmount);
-    const paidAmount = paymentType === PaymentType.ADVANCE ? advanceAmount : totalAmount;
+    this.logger.debug(
+      `[razorpay-verify] amount check paymentId=${dto.paymentId} bookingTotal=${totalAmount} ` +
+        `expectedAmount=${expectedAmount} receivedAmount=${receivedAmount}`,
+    );
+    if (expectedAmount !== receivedAmount) {
+      this.logger.error(
+        `[razorpay-verify] AMOUNT MISMATCH paymentId=${dto.paymentId} expected=${expectedAmount} received=${receivedAmount} — refusing to confirm`,
+      );
+      throw new BadRequestException(`Payment amount mismatch (expected ₹${expectedAmount}). Please contact support before collecting payment.`);
+    }
+
+    // FULL: payable = the amount this order/transaction was actually created and charged for
+    // (== expectedAmount — always the full CURRENT outstanding balance at order-creation time,
+    // which after an earlier ADVANCE payment is only the remaining balance, not the booking's
+    // original full total), remaining = 0 (a FULL order is always sized to fully settle the
+    // account, so nothing is left once it succeeds).
+    // ADVANCE: payable = the amount actually charged for the advance, remaining = total - payable
+    // (derived from the actually-charged amount, never independently rounded, so payable +
+    // remaining is always exactly totalAmount — no penny/rupee drift between the two).
+    // Previously FULL always set paidAmount = the booking's whole totalAmount regardless of what
+    // this transaction actually charged — correct for a first-time full payment, but wrong for a
+    // FULL-type order created to collect a leftover balance after an ADVANCE (e.g. total ₹1000,
+    // advance ₹623 already paid, this transaction only charges the remaining ₹377): paidAmount
+    // was being recorded as ₹1000, double-counting the earlier advance.
+    const paymentType = payment.paymentType ?? PaymentType.FULL;
+    const paidAmount = expectedAmount;
     const remainingAmount = paymentType === PaymentType.ADVANCE ? totalAmount - paidAmount : 0;
 
     this.logger.debug(`[razorpay-verify] DB transaction START (+${Date.now() - t0}ms) — marking SUCCESS`);
