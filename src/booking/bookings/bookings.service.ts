@@ -1140,13 +1140,13 @@ export class BookingsService {
   // Advance payment collected online at booking time — distinct from the worker's in-person
   // cash/QR collection and from the post-COMPLETED formal invoice (InvoicesService.generateFromBooking).
 
-  async getPaymentConfig(bookingId: string, customerId: string) {
+  async getPaymentConfig(bookingId: string, actor: AuthUser) {
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
       include: { invoice: { include: { payments: { where: { status: 'SUCCESS' } } } } },
     });
     if (!booking) throw new NotFoundException('Booking not found');
-    this.assertOwner(booking, customerId);
+    this.assertPaymentActor(booking, actor);
 
     if (booking.invoice) {
       const paid = r2(booking.invoice.payments.reduce((s, p) => s + p.amount, 0));
@@ -1167,16 +1167,16 @@ export class BookingsService {
     return { success: true, data: { tax, advancePayment, total, remaining: total } };
   }
 
-  async createPaymentOrder(bookingId: string, customerId: string, paymentType: PaymentType, orgId?: string) {
+  async createPaymentOrder(bookingId: string, actor: AuthUser, paymentType: PaymentType, orgId?: string) {
     const t0 = Date.now();
-    this.logger.debug(`[razorpay-order] START bookingId=${bookingId} paymentType=${paymentType} (+0ms)`);
+    this.logger.debug(`[razorpay-order] START bookingId=${bookingId} paymentType=${paymentType} actorId=${actor.id} actorRole=${actor.role} (+0ms)`);
 
     try {
       this.logger.debug(`[razorpay-order] booking lookup START (+${Date.now() - t0}ms)`);
       const booking = await this.requireBookingWithService(bookingId);
       this.logger.debug(`[razorpay-order] booking lookup END (+${Date.now() - t0}ms) status=${booking.status}`);
 
-      this.assertOwner(booking, customerId);
+      this.assertPaymentActor(booking, actor);
       // PENDING_PAYMENT (original case, paying the advance/full amount at booking time) is
       // always payable. Any other NON-terminal status is also payable — this is what makes
       // collecting the REMAINING balance later (after the advance has already been paid and
@@ -1189,14 +1189,14 @@ export class BookingsService {
       }
 
       this.logger.debug(`[razorpay-order] invoice START (+${Date.now() - t0}ms)`);
-      const invoice = await this.invoicesService.ensureAdvanceInvoice(bookingId, customerId, paymentType);
+      const invoice = await this.invoicesService.ensureAdvanceInvoice(bookingId, actor.id, paymentType);
       this.logger.debug(`[razorpay-order] invoice END (+${Date.now() - t0}ms) invoiceId=${invoice.id} total=${invoice.total}`);
 
       // Amount calculation and the Razorpay API call happen inside PaymentsService
       // .createRazorpayOrder() — it logs its own [razorpay-order] amount calculation and
       // [razorpay-order] razorpay API markers, so the trace stays linear and complete under
       // this one prefix regardless of which class emits which step.
-      const order = await this.paymentsService.createRazorpayOrder({ invoiceId: invoice.id, paymentType }, customerId, orgId);
+      const order = await this.paymentsService.createRazorpayOrder({ invoiceId: invoice.id, paymentType }, actor.id, orgId);
 
       this.logger.debug(`[razorpay-order] database update START (+${Date.now() - t0}ms)`);
       // Reset payment tracking for this attempt (e.g. retrying after a previously failed/abandoned order).
@@ -1228,7 +1228,7 @@ export class BookingsService {
   // and paymentStatus is set FAILED.
   async verifyBookingPayment(bookingId: string, dto: VerifyBookingPaymentDto, actor: AuthUser, orgId?: string) {
     const booking = await this.requireBookingWithService(bookingId);
-    this.assertOwner(booking, actor.id);
+    this.assertPaymentActor(booking, actor);
 
     const transaction = await this.prisma.transaction.findUnique({
       where: { razorpayOrderId: dto.razorpay_order_id },
@@ -1306,7 +1306,7 @@ export class BookingsService {
       this.logger.debug(`[razorpay-verify] booking lookup START (+${Date.now() - t0}ms)`);
       const booking = await this.requireBookingWithService(bookingId);
       this.logger.debug(`[razorpay-verify] booking lookup END (+${Date.now() - t0}ms) status=${booking.status}`);
-      this.assertOwner(booking, actor.id);
+      this.assertPaymentActor(booking, actor);
 
       // Delegates to PaymentsService.verifyRazorpay(), which logs its own [razorpay-verify]
       // payment lookup / signature verification / DB transaction / response preparation steps —
@@ -1449,6 +1449,41 @@ export class BookingsService {
 
   private assertOwner(booking: { customerId: string }, userId: string): void {
     if (booking.customerId !== userId) throw new ForbiddenException('This booking does not belong to you');
+  }
+
+  // Payment endpoints (payment-config, razorpay-order, razorpay-verify, verify) are reachable
+  // by two distinct actors following the existing role/ownership pattern used elsewhere in this
+  // file (e.g. cancel(), complete()): the paying CUSTOMER (booking.customerId), or the assigned
+  // WORKER collecting the remaining balance on-site via the Worker Panel's "Online Payment"
+  // option (Worker Job → Complete Service → Payment → Online Payment → this API). No other role
+  // is granted access here — never ADMIN/MANAGER, never an unrelated worker or customer.
+  private assertPaymentActor(booking: { id: string; customerId: string; workerId: string | null }, actor: AuthUser): void {
+    // Sanitized debug logging only — never logs JWT, Authorization header, or any Razorpay credential.
+    this.logger.debug(
+      `[payment-auth] check bookingId=${booking.id} actorId=${actor.id} actorRole=${actor.role} ` +
+        `requiredPermission=payment:initiate(own-booking) bookingCustomerId=${booking.customerId} bookingWorkerId=${booking.workerId ?? 'null'}`,
+    );
+
+    if (actor.role === Role.WORKER) {
+      if (booking.workerId !== actor.id) {
+        this.logger.warn(
+          `[payment-auth] DENY bookingId=${booking.id} actorId=${actor.id} actorRole=WORKER ` +
+            `reason="booking not assigned to this worker" bookingWorkerId=${booking.workerId ?? 'null'}`,
+        );
+        throw new ForbiddenException('This job is not assigned to you');
+      }
+      this.logger.debug(`[payment-auth] ALLOW bookingId=${booking.id} actorId=${actor.id} actorRole=WORKER (assigned worker)`);
+      return;
+    }
+
+    if (booking.customerId !== actor.id) {
+      this.logger.warn(
+        `[payment-auth] DENY bookingId=${booking.id} actorId=${actor.id} actorRole=${actor.role} ` +
+          `reason="booking does not belong to this user" bookingCustomerId=${booking.customerId}`,
+      );
+      throw new ForbiddenException('This booking does not belong to you');
+    }
+    this.logger.debug(`[payment-auth] ALLOW bookingId=${booking.id} actorId=${actor.id} actorRole=${actor.role} (owning customer)`);
   }
 
   // Same paidAmount/remainingAmount derivation getSummary() already uses — never advanceAmount,

@@ -168,24 +168,25 @@ export class BookingsController {
   // ─── Payment (Booking Payment screen) ──────────────────────────────────────
 
   @Get(':id/payment-config')
-  @Roles(Role.USER)
-  @ApiOperation({ summary: 'Get payment config for a booking — tax, advance payment, total, remaining — USER' })
+  @Roles(Role.USER, Role.WORKER)
+  @ApiOperation({ summary: 'Get payment config for a booking — tax, advance payment, total, remaining — USER / WORKER (assigned worker, remaining-balance collection)' })
   @ApiParam({ name: 'id', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Payment config' })
   @ApiResponse({ status: 404, description: 'Booking not found' })
   getPaymentConfig(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthUser) {
-    return this.bookingsService.getPaymentConfig(id, user.id);
+    return this.bookingsService.getPaymentConfig(id, user);
   }
 
   @Post(':id/payment/razorpay-order')
-  @Roles(Role.USER)
+  @Roles(Role.USER, Role.WORKER)
   @ApiOperation({
-    summary: 'Create a Razorpay order for a booking\'s advance or full payment — USER',
-    description: 'Auto-generates (or rebuilds, if not yet paid) the invoice for the requested paymentType on each call. Rejects if the booking is not PENDING (already paid/confirmed).',
+    summary: 'Create a Razorpay order for a booking\'s advance or full payment — USER / WORKER (assigned worker, Worker Panel: Payment step → Online Payment)',
+    description: 'Auto-generates (or rebuilds, if not yet paid) the invoice for the requested paymentType on each call. Rejects if the booking is not PENDING (already paid/confirmed). Callable by the paying customer, or by the worker assigned to the booking (collecting the remaining balance on-site).',
   })
   @ApiParam({ name: 'id', format: 'uuid' })
   @ApiResponse({ status: 201, description: 'Razorpay order created' })
   @ApiResponse({ status: 400, description: 'Booking is not awaiting payment' })
+  @ApiResponse({ status: 403, description: 'Forbidden — not the owning customer or the assigned worker' })
   @ApiResponse({ status: 404, description: 'Booking not found' })
   createPaymentOrder(
     @Param('id', ParseUUIDPipe) id: string,
@@ -193,14 +194,14 @@ export class BookingsController {
     @CurrentUser() user: AuthUser,
     @Req() req: Request,
   ) {
-    return this.bookingsService.createPaymentOrder(id, user.id, dto.paymentType, (req as any).organizationId);
+    return this.bookingsService.createPaymentOrder(id, user, dto.paymentType, (req as any).organizationId);
   }
 
   @Post(':id/payment/razorpay-verify')
   @HttpCode(HttpStatus.OK)
-  @Roles(Role.USER)
+  @Roles(Role.USER, Role.WORKER)
   @ApiOperation({
-    summary: 'Verify Razorpay payment and confirm the booking — USER',
+    summary: 'Verify Razorpay payment and confirm the booking — USER / WORKER (assigned worker)',
     description: 'Verifies the payment signature, marks the advance invoice PAID, and transitions the booking PENDING → CONFIRMED. Idempotent.',
   })
   @ApiParam({ name: 'id', format: 'uuid' })
@@ -218,9 +219,9 @@ export class BookingsController {
 
   @Post(':id/payment/verify')
   @HttpCode(HttpStatus.OK)
-  @Roles(Role.USER)
+  @Roles(Role.USER, Role.WORKER)
   @ApiOperation({
-    summary: 'Verify a booking payment (Razorpay Checkout callback) — USER',
+    summary: 'Verify a booking payment (Razorpay Checkout callback) — USER / WORKER (assigned worker)',
     description:
       'Takes only the fields Razorpay Checkout returns on success. Verifies the signature; on success ' +
       'sets paymentStatus SUCCESS and transitions the booking PENDING → CONFIRMED. On failure (bad signature ' +
