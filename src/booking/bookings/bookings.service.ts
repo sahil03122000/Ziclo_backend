@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  InternalServerErrorException,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
@@ -699,23 +700,48 @@ export class BookingsService {
     return { success: true, message: 'Job accepted', data: toWorkerJobDto(updated) };
   }
 
-  // Worker Panel "Before Photo" / "After Photo" steps.
+  // Worker Panel "Before Photo" / "After Photo" steps. Replace-not-duplicate per
+  // (bookingId, type): a mobile client retrying this call (e.g. the app crashing/losing
+  // connection right after the image itself uploaded to Cloudinary, then retrying the
+  // association call on reopen — exactly the kind of interruption "app closes/crashes/restarts
+  // during service" describes) previously just added another BookingPhoto row alongside the
+  // first. toWorkerJobDto() already only ever surfaces ONE before/after image (the earliest by
+  // createdAt), so a stray duplicate was harmless for display — but it's still not what "the
+  // before-service image" (singular) should mean, and left stale rows accumulating. Deleting
+  // any existing row of the same type first — inside the same request, before creating the new
+  // one — makes retries fully idempotent and guarantees exactly one photo per type per booking,
+  // without a schema migration or a second image system.
   async addPhoto(id: string, workerId: string, dto: AddBookingPhotoDto) {
     const booking = await this.requireBooking(id);
     if (booking.workerId !== workerId) throw new ForbiddenException('This job is not assigned to you');
 
-    await this.prisma.bookingPhoto.create({
-      data: {
-        bookingId: id,
-        imageUrl: dto.imageUrl,
-        type: dto.type,
-        latitude: dto.latitude,
-        longitude: dto.longitude,
-      },
-    });
+    await this.prisma.$transaction([
+      this.prisma.bookingPhoto.deleteMany({ where: { bookingId: id, type: dto.type } }),
+      this.prisma.bookingPhoto.create({
+        data: {
+          bookingId: id,
+          imageUrl: dto.imageUrl,
+          type: dto.type,
+          latitude: dto.latitude,
+          longitude: dto.longitude,
+        },
+      }),
+    ]);
 
+    // Re-fetched (not reused from the transaction) so the response always reflects exactly
+    // what's now persisted — same pattern every other mutation in this service already follows.
     const updated = await this.prisma.booking.findUniqueOrThrow({ where: { id }, include: BOOKING_INCLUDE });
-    return { success: true, message: 'Photo saved', data: toWorkerJobDto(updated) };
+    const data = toWorkerJobDto(updated);
+
+    // Error handling per spec: if the photo we just wrote isn't actually reflected in what we're
+    // about to return as "saved successfully", that's a real persistence/association failure —
+    // report it as one instead of a false success.
+    const savedPhoto = dto.type === TaskPhotoType.BEFORE ? data.beforeImage : data.afterImage;
+    if (!savedPhoto || savedPhoto.uri !== dto.imageUrl) {
+      throw new InternalServerErrorException('Photo upload succeeded but could not be saved to the job. Please try again.');
+    }
+
+    return { success: true, message: 'Photo saved', data };
   }
 
   // Worker Panel "Payment" step.
