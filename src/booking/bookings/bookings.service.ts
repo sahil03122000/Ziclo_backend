@@ -189,6 +189,12 @@ function toWorkerJobDto(booking: WorkerJobBooking) {
 
   return {
     id: booking.id,
+    // Worker-facing booking number — the same human-readable `bookingRef` (e.g. "BK-000013")
+    // already generated once per booking at creation time (generateRef(), used elsewhere for
+    // notifications/audit logs) and stored on the Booking row. Reused as-is here, never
+    // regenerated or faked on the frontend. `id` (the internal UUID, used for the user-facing
+    // reference and every API path param) is untouched and still returned above.
+    bookingNumber: booking.bookingRef ?? booking.id,
     status: toWorkerJobStatus(booking),
     serviceType: booking.service.name,
     customerName: booking.customer.name,
