@@ -495,10 +495,13 @@ export class BookingsController {
 
   @Patch(':id/reschedule')
   @Roles(Role.USER)
-  @ApiOperation({ summary: 'Reschedule own booking: PENDING / CONFIRMED → RESCHEDULED — USER' })
+  @ApiOperation({
+    summary: 'Reschedule own booking: PENDING / CONFIRMED / ASSIGNED → RESCHEDULED — USER',
+    description: 'Updates the SAME booking\'s date/time in place — no new booking is created, the booking id/reference is unchanged. ASSIGNED is included so a booking whose scheduled date/time has already passed without the job being started (a missed appointment) can still be moved to a new date; a booking that is IN_PROGRESS or already terminal (COMPLETED/CANCELLED/NO_SHOW) cannot.',
+  })
   @ApiParam({ name: 'id', description: 'Booking UUID', format: 'uuid' })
-  @ApiResponse({ status: 200, description: 'Booking rescheduled — admin notified' })
-  @ApiResponse({ status: 400, description: 'Booking is not in PENDING or CONFIRMED status' })
+  @ApiResponse({ status: 200, description: 'Booking rescheduled — admin/worker notified' })
+  @ApiResponse({ status: 400, description: 'Booking is not in a reschedulable status, new date is in the past, or the requested slot is unavailable' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   @ApiResponse({ status: 403, description: 'Forbidden — USER can only reschedule own bookings' })
   @ApiResponse({ status: 404, description: 'Booking not found' })

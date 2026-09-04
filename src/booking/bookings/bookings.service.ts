@@ -107,7 +107,13 @@ const ALLOWED_TRANSITIONS: Partial<Record<BookingStatus, BookingStatus[]>> = {
   // RESCHEDULED" 400 on every reschedule attempt. Root cause of "reschedule not working".
   [BookingStatus.PENDING]:     [BookingStatus.CONFIRMED, BookingStatus.CANCELLED, BookingStatus.RESCHEDULED],
   [BookingStatus.CONFIRMED]:   [BookingStatus.ASSIGNED, BookingStatus.IN_PROGRESS, BookingStatus.CANCELLED, BookingStatus.RESCHEDULED, BookingStatus.NO_SHOW],
-  [BookingStatus.ASSIGNED]:    [BookingStatus.IN_PROGRESS, BookingStatus.COMPLETED, BookingStatus.CANCELLED],
+  // RESCHEDULED is reachable from ASSIGNED too — a booking already assigned to a worker whose
+  // scheduled date/time passes without the job ever being started (a missed appointment; nothing
+  // in this codebase auto-completes/auto-no-shows a booking just because its date passed — see
+  // requireBookingWithService/complete()) sits in ASSIGNED indefinitely with no way for the
+  // customer to move it to a new date, since only PENDING/CONFIRMED could reach RESCHEDULED.
+  // Root cause of "cannot reschedule a booking whose date has already passed".
+  [BookingStatus.ASSIGNED]:    [BookingStatus.IN_PROGRESS, BookingStatus.COMPLETED, BookingStatus.CANCELLED, BookingStatus.RESCHEDULED],
   [BookingStatus.IN_PROGRESS]: [BookingStatus.COMPLETED, BookingStatus.CANCELLED],
   [BookingStatus.RESCHEDULED]: [BookingStatus.CONFIRMED, BookingStatus.CANCELLED],
 };
